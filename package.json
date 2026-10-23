@@ -1,0 +1,47 @@
+{
+  "name": "n8n-nodes-rolealpha",
+  "version": "0.1.0",
+  "description": "n8n nodes for running AI agents whose roles, duties, deciders and guardrails live in roleALPHA",
+  "keywords": [
+    "n8n-community-node-package",
+    "rolealpha",
+    "agents",
+    "governance",
+    "approval"
+  ],
+  "license": "MIT",
+  "private": true,
+  "author": {
+    "name": "roleALPHA GmbH"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc && node scripts/copy-icons.mjs",
+    "test": "tsc -p tsconfig.test.json && node --test dist-test/test/*.test.js",
+    "lint": "tsc --noEmit"
+  },
+  "n8n": {
+    "n8nNodesApiVersion": 1,
+    "strict": true,
+    "credentials": [
+      "dist/credentials/RoleAlphaAgentKeysApi.credentials.js",
+      "dist/credentials/RoleAlphaWebhookApi.credentials.js",
+      "dist/credentials/ApprovalSealApi.credentials.js"
+    ],
+    "nodes": [
+      "dist/nodes/RoleAlpha/RoleAlpha.node.js",
+      "dist/nodes/ApprovalSeal/ApprovalSeal.node.js",
+      "dist/nodes/RoleAlphaTrigger/RoleAlphaTrigger.node.js"
+    ]
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "n8n-workflow": "^2.16.0",
+    "typescript": "~5.9.0"
+  },
+  "peerDependencies": {
+    "n8n-workflow": "*"
+  }
+}
