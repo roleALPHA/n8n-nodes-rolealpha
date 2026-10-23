@@ -19,7 +19,7 @@ function contentGraph(): FakeGraph {
 	return new FakeGraph(
 		{
 			[STEP]: { name: 'Content', type: 'Value Creation', customId: 'x:content', data: { subtype: 'subprocess', description: 'Write texts, make visuals and videos, then set status review.' } },
-			[TEXT]: { name: 'Copy', type: 'Roles', data: { subtype: 'role', purpose: 'Good texts', accountabilities: ['Write texts per channel', 'Set finished drafts to review'] } },
+			[TEXT]: { name: 'Copy', type: 'Roles', data: { subtype: 'role', purpose: 'Good texts', accountabilities: ['Write texts per channel', 'Set finished drafts to review'], domains: ['Directus mk_beitraege'] } },
 			[VISUAL]: { name: 'Visual Design', type: 'Roles', data: { subtype: 'role', purpose: 'Good visuals', accountabilities: ['Make visuals from templates'] } },
 			[VIDEO]: { name: 'Video', type: 'Roles', data: { subtype: 'role', accountabilities: 'Make product videos' } },
 			[A_TEXT]: { name: 'Copywriter', type: 'AI Agents', data: { status: 'active' } },
@@ -47,12 +47,14 @@ const textBundle: ContextBundle = {
 	context: [{ kind: 'role', uuid: TEXT, name: 'Copy', body: { accountabilities: ['Write texts per channel', 'Set finished drafts to review'] } }],
 };
 
-test('getStep with roleDetails reads purpose and accountabilities of every responsible role', async () => {
+test('getStep with roleDetails reads purpose, accountabilities and domains of every responsible role', async () => {
 	const step = await getStep(contentGraph(), STEP, { resolveHolders: true, roleDetails: true });
 	const byName = Object.fromEntries(step.responsibleRoles.map((r) => [r.name, r]));
 	assert.deepEqual(byName['Copy'].accountabilities, ['Write texts per channel', 'Set finished drafts to review']);
 	assert.equal(byName['Visual Design'].purpose, 'Good visuals');
 	assert.deepEqual(byName['Video'].accountabilities, ['Make product videos']);
+	assert.deepEqual(byName['Copy'].domains, ['Directus mk_beitraege']);
+	assert.deepEqual(byName['Video'].domains, []);
 	assert.equal(byName['Copy'].holders?.agents[0].status, 'active');
 	const plain = await getStep(contentGraph(), STEP);
 	assert.equal(plain.responsibleRoles[0].accountabilities, undefined);

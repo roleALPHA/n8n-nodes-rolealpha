@@ -125,7 +125,7 @@ workflow that sends runs **Approval Seal: Verify** first and stops if the conten
 | Agent | List Agents | Over MCP: every agent of the organisation, paged. With agent keys: one item per key. By default it skips agents that are not active. | MCP OAuth2 or roleALPHA Agent Keys API |
 | Responsibility | Get Duties | Lists the steps the agent's roles are `RESPONSIBLE_FOR`, with the circle. | MCP OAuth2 |
 | Responsibility | Find Step by Custom ID | Looks up a step by an exact custom ID. | MCP OAuth2 |
-| Responsibility | Get Step | Returns a step with its predecessors, successors, parent and child steps, responsible, deciding and accountable roles (with their holders), and policies. With **Role Details** also purpose and accountabilities of each responsible role. | MCP OAuth2 |
+| Responsibility | Get Step | Returns a step with its predecessors, successors, parent and child steps, responsible, deciding and accountable roles (with their holders), and policies. With **Role Details** also purpose, accountabilities and domains of each responsible role. | MCP OAuth2 |
 | Responsibility | Get Decider | Returns the `DECIDES_ON` role. If there is none, it returns the `ACCOUNTABLE_FOR` role. | MCP OAuth2 |
 | Responsibility | Check Approver | **Fail-closed.** Is the acting person filling the deciding role? Only persons count; agents never do. | MCP OAuth2 |
 | Responsibility | Check Responsibility | Is one of the agent's roles responsible for this step? | MCP OAuth2 |

@@ -65,6 +65,7 @@ export interface RoleRef extends EntityRef {
 	holders?: RoleHolders;
 	purpose?: string | null;
 	accountabilities?: string[];
+	domains?: string[];
 }
 
 export interface StepSummary extends EntityRef {
@@ -354,12 +355,12 @@ function textList(value: unknown): string[] {
 	return typeof value === 'string' && value.trim() !== '' ? [value.trim()] : [];
 }
 
-/** Purpose and accountabilities of each role, so every role on a step can see what the others deliver. */
+/** Purpose, accountabilities and domains of each role, so every role on a step can see what the others deliver and where. */
 async function withRoleBodies(src: GraphSource, roles: RoleRef[]): Promise<RoleRef[]> {
 	const out: RoleRef[] = [];
 	for (const role of roles) {
 		const d = await src.details(role.uuid);
-		out.push({ ...role, purpose: str(d.data.purpose), accountabilities: textList(d.data.accountabilities) });
+		out.push({ ...role, purpose: str(d.data.purpose), accountabilities: textList(d.data.accountabilities), domains: textList(d.data.domains) });
 	}
 	return out;
 }

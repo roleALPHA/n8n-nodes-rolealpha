@@ -239,7 +239,7 @@ const properties: INodeProperties[] = [
 				name: 'roleDetails',
 				type: 'boolean',
 				default: false,
-				description: 'Whether Get Step also reads purpose and accountabilities of each responsible role (needed for Share → Build Input)',
+				description: 'Whether Get Step also reads purpose, accountabilities and domains of each responsible role (needed for Share → Build Input)',
 			},
 			{
 				displayName: 'Fail If Not Found',
