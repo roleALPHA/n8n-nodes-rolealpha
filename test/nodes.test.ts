@@ -182,3 +182,19 @@ test('node descriptions use generic English names', () => {
 	assert.equal(new ApprovalSeal().description.name, 'approvalSeal');
 	assert.equal(new RoleAlphaTrigger().description.name, 'roleAlphaTrigger');
 });
+
+test('Get Context over MCP finds the bundle among several content parts and reports what came back', async () => {
+	const parts = mcpCtx({ ...mcpParams, operation: 'getContext', agentUuid: AGENT }, { get_agent_context: () => bundle('active') });
+	const orig = parts.ctx.helpers.httpRequestWithAuthentication;
+	parts.ctx.helpers.httpRequestWithAuthentication = async (type: string, opts: any) => {
+		const reply: any = await orig(type, opts);
+		if (JSON.parse(opts.body).method !== 'tools/call') return reply;
+		const body = JSON.parse(reply.body);
+		body.result.content.unshift({ type: 'text', text: 'Context for agent' });
+		return { ...reply, body: JSON.stringify(body) };
+	};
+	const [[item]] = await new RoleAlpha().execute.call(parts.ctx);
+	assert.equal(item.json.agentName, 'Assistant');
+	const denied = mcpCtx({ ...mcpParams, operation: 'getContext', agentUuid: AGENT }, { get_agent_context: () => 'Forbidden: admin:tenant required' });
+	await assert.rejects(new RoleAlpha().execute.call(denied.ctx), /Forbidden: admin:tenant required/);
+});

@@ -67,10 +67,28 @@ export async function listAgents(client: McpClient, organisation: string): Promi
 	throw new Error(`search_agents did not finish after ${MAX_PAGES} pages`);
 }
 
+/** The bundle may come bare, wrapped in {bundle} or as one of several content parts. */
+function findBundle(value: unknown): ContextBundle | null {
+	if (Array.isArray(value)) {
+		for (const v of value) {
+			const b = findBundle(v);
+			if (b) return b;
+		}
+		return null;
+	}
+	if (!value || typeof value !== 'object') return null;
+	const obj = value as Record<string, unknown>;
+	if (obj.agent && typeof obj.agent === 'object') return obj as unknown as ContextBundle;
+	return obj.bundle ? findBundle(obj.bundle) : null;
+}
+
 /** The context bundle of one agent; view "agent" is exactly what the agent receives over its own key. */
 export async function getAgentContext(client: McpClient, organisation: string, agentUuid: string, view: ContextView = 'agent'): Promise<ContextBundle> {
-	const res = (await client.callTool('get_agent_context', { agent_uuid: agentUuid, organisation, view })) as Record<string, unknown>;
-	const bundle = (res && typeof res.bundle === 'object' ? res.bundle : res) as ContextBundle;
-	if (!bundle || typeof bundle !== 'object' || !bundle.agent) throw new Error(`get_agent_context returned no agent for ${agentUuid}`);
+	const res = await client.callTool('get_agent_context', { agent_uuid: agentUuid, organisation, view });
+	const bundle = findBundle(res);
+	if (!bundle) {
+		const raw = typeof res === 'string' ? res : JSON.stringify(res);
+		throw new Error(`get_agent_context returned no agent for ${agentUuid}: ${String(raw).slice(0, 400)}`);
+	}
 	return { ...bundle, guardrails: bundle.guardrails ?? [], context: bundle.context ?? [] };
 }
