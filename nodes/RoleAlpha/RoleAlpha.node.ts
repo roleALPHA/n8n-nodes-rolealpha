@@ -19,11 +19,14 @@ import {
 	McpGraphSource,
 	responsibleRolesFor,
 	type GraphSource,
+	type Step,
 } from '../../lib/graph';
 import { getAgentContext, listAgents, type ContextView } from '../../lib/agents';
 import { keyFor, parseKeyring, type AgentKey } from '../../lib/keys';
-import { buildSystemPrompt, type ContextBundle } from '../../lib/prompt';
+import { buildSystemPrompt, buildTask, type ContextBundle } from '../../lib/prompt';
 import { isDue } from '../../lib/schedule';
+import { buildShareInput, checkShare, SHARE_SCHEMA, type ShareInput, type ShareResult } from '../../lib/share';
+import { findStaleWaits, planAfterRun, type FinishedRun, type WaitRow } from '../../lib/waits';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -51,6 +54,8 @@ const properties: INodeProperties[] = [
 			{ name: 'Responsibility', value: 'responsibility', description: 'Traverse roles, steps and deciders' },
 			{ name: 'Prompt', value: 'prompt', description: 'Build a system prompt from roleALPHA data' },
 			{ name: 'Schedule', value: 'schedule', description: 'Decide whether a step is due' },
+			{ name: 'Share', value: 'share', description: 'The part of a step that belongs to the agent\'s roles, and what it needs from other roles' },
+			{ name: 'Wait', value: 'wait', description: 'Wait for and wake other agents within one step' },
 		],
 		default: 'agent',
 	},
@@ -226,6 +231,13 @@ const properties: INodeProperties[] = [
 				description: 'Whether Get Step also reads the persons and agents filling each role',
 			},
 			{
+				displayName: 'Role Details',
+				name: 'roleDetails',
+				type: 'boolean',
+				default: false,
+				description: 'Whether Get Step also reads purpose and accountabilities of each responsible role (needed for Share → Build Input)',
+			},
+			{
 				displayName: 'Fail If Not Found',
 				name: 'failIfNotFound',
 				type: 'boolean',
@@ -266,15 +278,15 @@ const properties: INodeProperties[] = [
 		default: '={{ $json }}',
 		required: true,
 		description: 'Output of Agent → Get Context',
-		displayOptions: show('prompt', ['buildSystemPrompt']),
+		displayOptions: { show: { resource: ['prompt', 'share'], operation: ['buildSystemPrompt', 'buildInput'] } },
 	},
 	{
 		displayName: 'Step',
 		name: 'stepJson',
 		type: 'json',
 		default: '',
-		description: 'Output of Responsibility → Get Step (optional)',
-		displayOptions: show('prompt', ['buildSystemPrompt']),
+		description: 'Output of Responsibility → Get Step (optional for the prompt, required for Share)',
+		displayOptions: { show: { resource: ['prompt', 'share'], operation: ['buildSystemPrompt', 'buildInput'] } },
 	},
 	{
 		displayName: 'Duties',
@@ -290,7 +302,7 @@ const properties: INodeProperties[] = [
 		type: 'string',
 		default: '',
 		placeholder: 'schedule, event, chat …',
-		displayOptions: show('prompt', ['buildSystemPrompt']),
+		displayOptions: { show: { resource: ['prompt', 'share'], operation: ['buildSystemPrompt', 'buildInput'] } },
 	},
 	{
 		displayName: 'Event Data',
@@ -298,6 +310,14 @@ const properties: INodeProperties[] = [
 		type: 'json',
 		default: '',
 		description: 'Shown to the model as data, never as instructions',
+		displayOptions: { show: { resource: ['prompt', 'share'], operation: ['buildSystemPrompt', 'buildInput'] } },
+	},
+	{
+		displayName: 'Share',
+		name: 'share',
+		type: 'json',
+		default: '',
+		description: 'Output of Share → Check (optional). Adds the agent\'s part, the rules for waiting within the step and a task text.',
 		displayOptions: show('prompt', ['buildSystemPrompt']),
 	},
 	{
@@ -308,6 +328,91 @@ const properties: INodeProperties[] = [
 		default: '',
 		description: 'One technical rule per line, e.g. output format. No roles, persons or duties.',
 		displayOptions: show('prompt', ['buildSystemPrompt']),
+	},
+
+	// ---------------------------------------------------------------- share
+	{
+		displayName: 'Operation',
+		name: 'operation',
+		type: 'options',
+		noDataExpression: true,
+		displayOptions: { show: { resource: ['share'] } },
+		options: [
+			{ name: 'Build Input', value: 'buildInput', action: 'Build the input for the share decision', description: 'System message, prompt and ids for a model call; the step needs Role Details' },
+			{ name: 'Check', value: 'check', action: 'Check the share decision', description: 'Keeps only real accountabilities and real other roles of the step' },
+		],
+		default: 'buildInput',
+	},
+	{
+		displayName: 'Responsible Roles',
+		name: 'roles',
+		type: 'json',
+		default: '',
+		description: 'The agent\'s roles that are responsible for the step: output of Responsibility → Check Responsibility, an array of roles or of UUIDs. Empty: every role of the bundle on the step.',
+		displayOptions: show('share', ['buildInput']),
+	},
+	{
+		displayName: 'Share Input',
+		name: 'shareInput',
+		type: 'json',
+		default: '',
+		required: true,
+		description: 'Output of Share → Build Input',
+		displayOptions: show('share', ['check']),
+	},
+	{
+		displayName: 'Model Answer',
+		name: 'answer',
+		type: 'json',
+		default: '={{ $json.output }}',
+		required: true,
+		description: 'The structured answer of the model (duties, notMine, reason)',
+		displayOptions: show('share', ['check']),
+	},
+
+	// ---------------------------------------------------------------- wait
+	{
+		displayName: 'Operation',
+		name: 'operation',
+		type: 'options',
+		noDataExpression: true,
+		displayOptions: { show: { resource: ['wait'] } },
+		options: [
+			{ name: 'Plan After Run', value: 'planAfterRun', action: 'Plan what follows a run', description: 'Whether the agent waited, which row to add, whom to wake and which rows to remove' },
+			{ name: 'Find Stale Waits', value: 'findStale', action: 'Find waits nobody answered', description: 'For a scheduler: waits older than a limit, e.g. when a person fills the awaited role' },
+		],
+		default: 'planAfterRun',
+	},
+	{
+		displayName: 'Rows',
+		name: 'rows',
+		type: 'json',
+		default: '={{ $input.all().map(item => item.json) }}',
+		description: 'Stored wait rows (state, step_uuid, agent_uuid, roles, waits_for, record_keys, event, run_id, attempts, progress, at)',
+		displayOptions: { show: { resource: ['wait'] } },
+	},
+	{
+		displayName: 'Finished Run',
+		name: 'run',
+		type: 'json',
+		default: '',
+		required: true,
+		placeholder: '{"runId":"","stepUuid":"","agentUuid":"","roleUuids":[],"recordKeys":[],"startedAt":"","event":{},"attempt":0}',
+		description: 'The run that just ended',
+		displayOptions: show('wait', ['planAfterRun']),
+	},
+	{
+		displayName: 'Options',
+		name: 'waitOptions',
+		type: 'collection',
+		placeholder: 'Add Option',
+		default: {},
+		displayOptions: { show: { resource: ['wait'] } },
+		options: [
+			{ displayName: 'Max Attempts', name: 'maxAttempts', type: 'number', typeOptions: { minValue: 1 }, default: 5, description: 'How often one agent is woken for the same step and records' },
+			{ displayName: 'Keep Done Rows (Hours)', name: 'keepDoneHours', type: 'number', typeOptions: { minValue: 1 }, default: 168 },
+			{ displayName: 'Older Than (Minutes)', name: 'olderThanMinutes', type: 'number', typeOptions: { minValue: 1 }, default: 60, description: 'Find Stale Waits: only waits at least this old' },
+		],
 	},
 
 	// ---------------------------------------------------------------- schedule
@@ -531,6 +636,24 @@ export class RoleAlpha implements INodeType {
 			return [out];
 		}
 
+		// Wait decisions look at all stored rows at once and return one plan.
+		if (resource === 'wait') {
+			const rowsRaw = parseJsonParam(this, 'rows', 0);
+			const rows = (Array.isArray(rowsRaw) ? rowsRaw : []).filter((r) => r && typeof r === 'object' && (r as IDataObject).state) as WaitRow[];
+			const opts = this.getNodeParameter('waitOptions', 0, {}) as IDataObject;
+			const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : undefined);
+			if (operation === 'findStale') {
+				const res = findStaleWaits(rows, { maxAttempts: num(opts.maxAttempts), olderThanMinutes: num(opts.olderThanMinutes) });
+				return [[{ json: res as unknown as IDataObject }]];
+			}
+			const run = parseJsonParam(this, 'run', 0) as FinishedRun | undefined;
+			if (!run || !run.runId || !run.stepUuid || !run.agentUuid || !run.startedAt) {
+				throw new NodeOperationError(this.getNode(), 'Finished Run needs runId, stepUuid, agentUuid and startedAt');
+			}
+			const plan = planAfterRun(rows, run, { maxAttempts: num(opts.maxAttempts), keepDoneHours: num(opts.keepDoneHours) });
+			return [[{ json: plan as unknown as IDataObject }]];
+		}
+
 		for (let i = 0; i < items.length; i++) {
 			try {
 				if (resource === 'agent') {
@@ -578,7 +701,7 @@ export class RoleAlpha implements INodeType {
 						out.push({ json: { found: !!step, customId, step: step as unknown as IDataObject }, pairedItem: { item: i } });
 					} else if (operation === 'getStep') {
 						const uuid = await resolveStepUuid(this, g, this.getNodeParameter('step', i) as string, i);
-						const step = await getStep(g, uuid, { resolveHolders: opts.resolveHolders !== false });
+						const step = await getStep(g, uuid, { resolveHolders: opts.resolveHolders !== false, roleDetails: opts.roleDetails === true });
 						out.push({ json: { step: step as unknown as IDataObject }, pairedItem: { item: i } });
 					} else if (operation === 'getDecider') {
 						const uuid = await resolveStepUuid(this, g, this.getNodeParameter('step', i) as string, i);
@@ -609,20 +732,60 @@ export class RoleAlpha implements INodeType {
 					const bundle = (raw && typeof raw.bundle === 'object' ? raw.bundle : raw) as unknown as ContextBundle;
 					if (!bundle || !bundle.agent) throw new NodeOperationError(this.getNode(), 'Context Bundle has no agent', { itemIndex: i });
 					const stepRaw = parseJsonParam(this, 'stepJson', i) as IDataObject | undefined;
-					const step = (stepRaw && typeof stepRaw.step === 'object' ? stepRaw.step : stepRaw) as never;
+					const step = (stepRaw && typeof stepRaw.step === 'object' ? stepRaw.step : stepRaw) as Step | undefined;
 					const duties = parseJsonParam(this, 'duties', i);
+					const shareRaw = parseJsonParam(this, 'share', i) as IDataObject | undefined;
+					const share = (shareRaw && Array.isArray(shareRaw.duties) ? shareRaw : null) as unknown as ShareResult | null;
 					const rules = String(this.getNodeParameter('extraRules', i, '') ?? '')
 						.split(/\r?\n/)
 						.map((r) => r.trim())
 						.filter(Boolean);
 					const systemPrompt = buildSystemPrompt({
 						bundle: { ...bundle, guardrails: bundle.guardrails ?? [], context: bundle.context ?? [] },
-						step: step ?? null,
+						step: (step as never) ?? null,
 						duties: Array.isArray(duties) ? (duties as never) : [],
 						trigger: { type: (this.getNodeParameter('triggerType', i, '') as string) || undefined, event: parseJsonParam(this, 'event', i) },
 						extraRules: rules,
+						share,
 					});
-					out.push({ json: { ...items[i].json, systemPrompt }, pairedItem: { item: i } });
+					const json: IDataObject = { ...items[i].json, systemPrompt };
+					if (share && step) json.task = buildTask({ step, share, triggerType: (this.getNodeParameter('triggerType', i, '') as string) || undefined });
+					out.push({ json, pairedItem: { item: i } });
+					continue;
+				}
+
+				if (resource === 'share') {
+					if (operation === 'buildInput') {
+						const raw = parseJsonParam(this, 'bundle', i) as IDataObject | undefined;
+						const bundle = (raw && typeof raw.bundle === 'object' ? raw.bundle : raw) as unknown as ContextBundle;
+						if (!bundle || !bundle.agent) throw new NodeOperationError(this.getNode(), 'Context Bundle has no agent', { itemIndex: i });
+						const stepRaw = parseJsonParam(this, 'stepJson', i) as IDataObject | undefined;
+						const step = (stepRaw && typeof stepRaw.step === 'object' ? stepRaw.step : stepRaw) as Step | undefined;
+						if (!step || !Array.isArray(step.responsibleRoles)) throw new NodeOperationError(this.getNode(), 'Step is missing or has no responsible roles', { itemIndex: i });
+						if (step.responsibleRoles.some((r) => r.accountabilities === undefined)) {
+							throw new NodeOperationError(this.getNode(), 'The step has no role details; turn on Role Details in Get Step', { itemIndex: i });
+						}
+						const rolesRaw = parseJsonParam(this, 'roles', i) as unknown;
+						const rolesList = Array.isArray(rolesRaw)
+							? rolesRaw
+							: rolesRaw && typeof rolesRaw === 'object' && Array.isArray((rolesRaw as IDataObject).roles)
+								? ((rolesRaw as IDataObject).roles as unknown[])
+								: [];
+						const roleUuids = rolesList.map((r) => (r && typeof r === 'object' ? String((r as IDataObject).uuid ?? '') : String(r))).filter(Boolean);
+						const input = buildShareInput({ ...bundle, guardrails: bundle.guardrails ?? [], context: bundle.context ?? [] }, step, roleUuids, {
+							type: (this.getNodeParameter('triggerType', i, '') as string) || undefined,
+							event: parseJsonParam(this, 'event', i),
+						});
+						out.push({ json: { ...input, schema: SHARE_SCHEMA } as unknown as IDataObject, pairedItem: { item: i } });
+					} else {
+						const input = parseJsonParam(this, 'shareInput', i) as ShareInput | undefined;
+						if (!input || !Array.isArray(input.accountabilities) || !Array.isArray(input.others)) {
+							throw new NodeOperationError(this.getNode(), 'Share Input is not the output of Share → Build Input', { itemIndex: i });
+						}
+						let answer = parseJsonParam(this, 'answer', i) as unknown;
+						if (answer && typeof answer === 'object' && (answer as IDataObject).output && typeof (answer as IDataObject).output === 'object') answer = (answer as IDataObject).output;
+						out.push({ json: checkShare(input, answer) as unknown as IDataObject, pairedItem: { item: i } });
+					}
 					continue;
 				}
 

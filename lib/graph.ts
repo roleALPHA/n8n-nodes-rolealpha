@@ -63,6 +63,8 @@ export interface RoleHolders {
 
 export interface RoleRef extends EntityRef {
 	holders?: RoleHolders;
+	purpose?: string | null;
+	accountabilities?: string[];
 }
 
 export interface StepSummary extends EntityRef {
@@ -296,7 +298,22 @@ async function withHolders(src: GraphSource, roles: EntityRef[]): Promise<RoleRe
 	return out;
 }
 
-export async function getStep(src: GraphSource, stepUuid: string, opts: { resolveHolders?: boolean } = {}): Promise<Step> {
+function textList(value: unknown): string[] {
+	if (Array.isArray(value)) return value.map((v) => (typeof v === 'string' ? v.trim() : JSON.stringify(v))).filter(Boolean);
+	return typeof value === 'string' && value.trim() !== '' ? [value.trim()] : [];
+}
+
+/** Purpose and accountabilities of each role, so every role on a step can see what the others deliver. */
+async function withRoleBodies(src: GraphSource, roles: RoleRef[]): Promise<RoleRef[]> {
+	const out: RoleRef[] = [];
+	for (const role of roles) {
+		const d = await src.details(role.uuid);
+		out.push({ ...role, purpose: str(d.data.purpose), accountabilities: textList(d.data.accountabilities) });
+	}
+	return out;
+}
+
+export async function getStep(src: GraphSource, stepUuid: string, opts: { resolveHolders?: boolean; roleDetails?: boolean } = {}): Promise<Step> {
 	const [d, rels] = await Promise.all([src.details(stepUuid), src.relationships(stepUuid)]);
 	const roles = (type: string) => edges(rels, type, 'incoming').filter((r) => !isPersonType(r.entityType ?? ''));
 	const policies: Step['policies'] = [];
@@ -319,6 +336,7 @@ export async function getStep(src: GraphSource, stepUuid: string, opts: { resolv
 		decidingRoles = await withHolders(src, decidingRoles);
 		accountableRoles = await withHolders(src, accountableRoles);
 	}
+	if (opts.roleDetails) responsibleRoles = await withRoleBodies(src, responsibleRoles);
 	return {
 		...toStepSummary(d),
 		predecessors: edges(rels, 'DEPENDS_ON', 'outgoing'),

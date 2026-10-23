@@ -15,12 +15,16 @@ n8n nodes for **generic agent runners**. One workflow runs every agent. Each age
 | Agent | List Agents | Over MCP: every agent of the organisation, paged. With agent keys: one item per key. By default it skips agents that are not active. | MCP OAuth2 or roleALPHA Agent Keys API |
 | Responsibility | Get Duties | Lists the steps the agent's roles are `RESPONSIBLE_FOR`, with the circle. | MCP OAuth2 |
 | Responsibility | Find Step by Custom ID | Looks up a step by an exact custom ID. | MCP OAuth2 |
-| Responsibility | Get Step | Returns a step with its predecessors, successors, parent and child steps, responsible, deciding and accountable roles (with their holders), and policies. | MCP OAuth2 |
+| Responsibility | Get Step | Returns a step with its predecessors, successors, parent and child steps, responsible, deciding and accountable roles (with their holders), and policies. With **Role Details** also purpose and accountabilities of each responsible role. | MCP OAuth2 |
 | Responsibility | Get Decider | Returns the `DECIDES_ON` role. If there is none, it returns the `ACCOUNTABLE_FOR` role. | MCP OAuth2 |
 | Responsibility | Check Approver | **Fail-closed.** Is the acting person filling the deciding role? Only persons count; agents never do. | MCP OAuth2 |
 | Responsibility | Check Responsibility | Is one of the agent's roles responsible for this step? | MCP OAuth2 |
 | Responsibility | Get Role Holders | Returns the persons (with address) and agents filling a role. | MCP OAuth2 |
-| Prompt | Build System Prompt | Builds the system prompt from the bundle, the step, the duties and the trigger. Event data is passed as data, never as instructions. | – |
+| Prompt | Build System Prompt | Builds the system prompt from the bundle, the step, the duties and the trigger. Event data is passed as data, never as instructions. With a **Share** it adds the agent's part, what is not its part, the rules for waiting within the step, and returns `task` as the user message. | – |
+| Share | Build Input | Prepares the model call that decides the agent's part of a step: only the accountabilities of its own roles count, the other responsible roles of the step are listed with theirs. Returns `systemMessage`, `prompt` and `schema` for a structured output parser. Needs Get Step with Role Details. | – |
+| Share | Check | Checks the model answer against roleALPHA: drops duties that are no accountability of the agent and needs on roles that are not on the step. Returns `duties` (with `needs`), `notMine`, `waitsFor` and `waitRoleUuids`. | – |
+| Wait | Plan After Run | Decides what follows a run on a step from the stored wait rows: the `done` row to add, which waiting agents of the same step to wake (their awaited role just delivered), which rows to remove, and which waits are stuck at the attempt limit. Covers a result that arrived while the agent was deciding to wait. | – |
+| Wait | Find Stale Waits | For a scheduler: waits nobody answered within a time, e.g. because a person fills the awaited role. | – |
 | Schedule | Is Due | Decides from the step `frequency` (and `termin` / due date) whether a run is due in the current period. | – |
 
 ### Approval Seal (`approvalSeal`)
@@ -59,6 +63,10 @@ Scheduler (cron)                        Event router (one webhook)
                           ├ roleALPHA: Build System Prompt
                           └ AI Agent (+ data tool limited to the role's domains)
 ```
+
+### Dependencies within a step
+
+A step can hold many tasks shared by several roles, and their parts can depend on each other (a visual needs the text, the hand-over needs all parts). The runner asks **Share** for the agent's part and what it needs. The agent checks the data before a dependent task; if the result is missing it does what it can, records a wait (`wait_for` tool: a row with `state = waiting`, `waits_for` = role UUIDs) and ends. After every run, **Wait → Plan After Run** adds a `done` row, wakes the agents of the same step that wait on one of the finished run's roles (same records), and the runner is called again for them with `event.wake = {attempt, wokenBy}`. Rows live in any store of the workflow, e.g. an n8n data table with the columns `state, step_uuid, step_custom_id, agent_uuid, agent_name, roles, waits_for, reason, record_keys, event, run_id, attempts, progress, at`.
 
 Gates (approvals) follow this order: **Get Decider → Check Approver → Approval Seal: Sign**. The channel that sends runs **Approval Seal: Verify** first.
 

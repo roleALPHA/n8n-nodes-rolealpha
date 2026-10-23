@@ -1,6 +1,6 @@
 {
   "name": "n8n-nodes-rolealpha",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "n8n nodes for running AI agents whose roles, duties, deciders and guardrails live in roleALPHA",
   "keywords": [
     "n8n-community-node-package",
