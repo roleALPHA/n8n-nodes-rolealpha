@@ -19,12 +19,15 @@ n8n nodes for **generic agent runners**. One workflow runs every agent. Each age
 | Responsibility | Get Decider | Returns the `DECIDES_ON` role. If there is none, it returns the `ACCOUNTABLE_FOR` role. | MCP OAuth2 |
 | Responsibility | Check Approver | **Fail-closed.** Is the acting person filling the deciding role? Only persons count; agents never do. | MCP OAuth2 |
 | Responsibility | Check Responsibility | Is one of the agent's roles responsible for this step? | MCP OAuth2 |
+| Responsibility | Get Circle Lead | One item per circle of the agent's roles: the role that leads the circle and its holders, e.g. to escalate to. Recognised from a lead flag on the role, else "Lead Link" in its purpose, else a custom ID ending in `:lead`, else the role that decides on or is accountable for the circle. `lead` is null when none is found. | MCP OAuth2 |
 | Responsibility | Get Role Holders | Returns the persons (with address) and agents filling a role. | MCP OAuth2 |
 | Prompt | Build System Prompt | Builds the system prompt from the bundle, the step, the duties and the trigger. Event data is passed as data, never as instructions. With a **Share** it adds the agent's part, what is not its part, the rules for waiting within the step, and returns `task` as the user message. | – |
 | Share | Build Input | Prepares the model call that decides the agent's part of a step: only the accountabilities of its own roles count, the other responsible roles of the step are listed with theirs. Returns `systemMessage`, `prompt` and `schema` for a structured output parser. Needs Get Step with Role Details. | – |
 | Share | Check | Checks the model answer against roleALPHA: drops duties that are no accountability of the agent and needs on roles that are not on the step. Returns `duties` (with `needs`), `notMine`, `waitsFor` and `waitRoleUuids`. | – |
 | Wait | Plan After Run | Decides what follows a run on a step from the stored wait rows: the `done` row to add, which waiting agents of the same step to wake (their awaited role just delivered), which rows to remove, and which waits are stuck at the attempt limit. Covers a result that arrived while the agent was deciding to wait. | – |
-| Wait | Find Stale Waits | For a scheduler: waits nobody answered within a time, e.g. because a person fills the awaited role. | – |
+| Wait | Check Start | Duplicate-run guard. After the runner added a lease row for its run (`state = running`), the oldest live lease of the same agent, step and records wins. A later start does not run; it returns a `queueRow` that runs when the busy run ends. Leases older than the run timeout are dead and released. Fail-closed when the own lease is missing. | – |
+| Wait | Find Stale Waits | For a scheduler: waits nobody answered in time (e.g. a person fills the awaited role), queued starts whose busy run died, dead leases, expired rows, and waits at the attempt limit to escalate (`escalate`, reported once). | – |
+| Settings | Resolve | Runner limits from defaults and a settings table (`scope, target, key, value`): default < global < step < agent. Every value is clamped to fixed bounds; unknown keys and unusable values are reported in `settingProblems` and never applied. | – |
 | Schedule | Is Due | Decides from the step `frequency` (and `termin` / due date) whether a run is due in the current period. | – |
 
 ### Approval Seal (`approvalSeal`)
@@ -68,6 +71,20 @@ Scheduler (cron)                        Event router (one webhook)
 
 A step can hold many tasks shared by several roles, and their parts can depend on each other (a visual needs the text, the hand-over needs all parts). The runner asks **Share** for the agent's part and what it needs. The agent checks the data before a dependent task; if the result is missing it does what it can, records a wait (`wait_for` tool: a row with `state = waiting`, `waits_for` = role UUIDs) and ends. After every run, **Wait → Plan After Run** adds a `done` row, wakes the agents of the same step that wait on one of the finished run's roles (same records), and the runner is called again for them with `event.wake = {attempt, wokenBy}`. Rows live in any store of the workflow, e.g. an n8n data table with the columns `state, step_uuid, step_custom_id, agent_uuid, agent_name, roles, waits_for, reason, record_keys, event, run_id, attempts, progress, at`.
 
+### Robustness and limits
+
+| Setting | Default | Bounds | Meaning |
+|---|---|---|---|
+| `maxWaitMinutes` | 60 | 5–10080 | A wait nobody answered is started again by the scheduler after this time |
+| `maxAttempts` | 5 | 1–20 | Wake-ups per wait; at the limit the wait is escalated and never woken again by itself |
+| `keepDoneHours` | 168 | 1–2160 | How long `done` and `escalated` rows are kept |
+| `maxIterations` | 15 | 1–50 | Tool calls of the agent per run |
+| `runTimeoutMinutes` | 15 | 1–120 | A run older than this counts as dead; its lease is released |
+| `escalate` | true | – | Report stuck waits to the role that leads the circle |
+| `shareCacheHours` | 24 | 0–720 | Reuse a share decision while step, roles and trigger kind stay the same (0 = never) |
+
+Every wake-up names one row (`claimId`). The runner deletes that row first and wakes only if the delete removed it, so two runs that plan at the same time never wake an agent twice. Texts that one agent leaves for another (`reason`, `event`) are cut to fixed sizes and passed as data. A duty marked `handover` (it closes the step) always waits on every other filled role of the step.
+
 Gates (approvals) follow this order: **Get Decider → Check Approver → Approval Seal: Sign**. The channel that sends runs **Approval Seal: Verify** first.
 
 ## Security notes
@@ -76,6 +93,9 @@ Gates (approvals) follow this order: **Get Decider → Check Approver → Approv
 - Agents never approve. Check Approver ignores agents that fill the deciding role.
 - The prompt marks trigger payloads as data. Guardrails take precedence over event content.
 - Keep `requireActive` and `requireGuardrails` on in production.
+- Settings from a table are clamped to fixed bounds: a wrong row can make the runner more careful, never unbounded.
+- Duplicate runs are blocked by leases; wake-ups are claimed before they fire.
+- No credentials are kept in wait, settings or cache rows.
 
 ## Build and install (self-hosted)
 
@@ -83,9 +103,9 @@ Gates (approvals) follow this order: **Get Decider → Check Approver → Approv
 npm install
 npm run build
 npm test
-npm pack                     # → n8n-nodes-rolealpha-0.1.0.tgz
+npm pack                     # → n8n-nodes-rolealpha-0.3.0.tgz
 # on the n8n host (custom extensions folder, e.g. ~/.n8n/custom):
-npm install /path/to/n8n-nodes-rolealpha-0.1.0.tgz
+npm install /path/to/n8n-nodes-rolealpha-0.3.0.tgz
 # restart n8n
 ```
 

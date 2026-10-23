@@ -166,7 +166,8 @@ test('a finished run wakes the agents of the step that wait on its role', () => 
 		['Video', 1],
 	]);
 	assert.deepEqual(plan.wake[0].event, { collection: 'posts', keys: ['7'], wake: { attempt: 1, wokenBy: 'Copywriter', wokenByRoles: [TEXT], waitedFor: 'LinkedIn text missing' } });
-	assert.deepEqual(plan.remove.sort(), [1, 2, 6, 7], 'answered waits, the replaced own done row and an expired one');
+	assert.deepEqual(plan.wake.map((w) => w.claimId), [1, 2], 'each wake-up claims its wait row');
+	assert.deepEqual(plan.remove.sort(), [6, 7], 'the replaced own done row and an expired one');
 	assert.equal(plan.doneRow?.state, 'done');
 	assert.equal(plan.doneRow?.roles, TEXT);
 	assert.equal(plan.doneRow?.record_keys, '7');
@@ -196,7 +197,8 @@ test('a result that arrived during the run wakes the waiting agent itself', () =
 	];
 	const plan = planAfterRun(rows, { runId: '400', stepUuid: STEP, agentUuid: A_VISUAL, roleUuids: [VISUAL], startedAt: '2026-10-23T09:50:00Z', recordKeys: ['7'] }, { now: NOW });
 	assert.deepEqual(plan.wake.map((w) => [w.agentUuid, w.attempt, (w.event.wake as any).wokenBy]), [[A_VISUAL, 2, 'arrived while waiting']]);
-	assert.deepEqual(plan.remove, [1]);
+	assert.equal(plan.wake[0].claimId, 1);
+	assert.deepEqual(plan.remove, []);
 	const early = planAfterRun(rows, { runId: '400', stepUuid: STEP, agentUuid: A_VISUAL, roleUuids: [VISUAL], startedAt: '2026-10-23T09:58:00Z', recordKeys: ['7'] }, { now: NOW });
 	assert.deepEqual(early.wake, [], 'a result from before the run was already visible to the agent');
 });
@@ -217,9 +219,10 @@ test('findStaleWaits restarts old waits once per agent and records', () => {
 		waitRow({ id: 4, agent_uuid: A_TEXT, at: '2026-10-23T07:00:00Z', attempts: 5 }),
 	];
 	const res = findStaleWaits(rows, { now: NOW, olderThanMinutes: 60 });
-	assert.deepEqual(res.wake.map((w) => [w.agentUuid, w.attempt]), [[A_VISUAL, 2]]);
-	assert.deepEqual(res.remove.sort(), [1, 2]);
+	assert.deepEqual(res.wake.map((w) => [w.agentUuid, w.attempt, w.claimId]), [[A_VISUAL, 2, 2]]);
+	assert.deepEqual(res.remove.sort(), [1]);
 	assert.deepEqual(res.stuck.map((r) => r.id), [4]);
+	assert.deepEqual(res.escalate, [4]);
 });
 
 function ctxFor(params: Record<string, unknown>) {

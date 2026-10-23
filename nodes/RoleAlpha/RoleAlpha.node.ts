@@ -13,6 +13,7 @@ import {
 	findStepByCustomId,
 	getAgentRoles,
 	getDecider,
+	getCircleLeads,
 	getDuties,
 	getRoleHolders,
 	getStep,
@@ -26,7 +27,8 @@ import { keyFor, parseKeyring, type AgentKey } from '../../lib/keys';
 import { buildSystemPrompt, buildTask, type ContextBundle } from '../../lib/prompt';
 import { isDue } from '../../lib/schedule';
 import { buildShareInput, checkShare, SHARE_SCHEMA, type ShareInput, type ShareResult } from '../../lib/share';
-import { findStaleWaits, planAfterRun, type FinishedRun, type WaitRow } from '../../lib/waits';
+import { checkStart, findStaleWaits, planAfterRun, type FinishedRun, type Limits, type WaitRow } from '../../lib/waits';
+import { DEFAULT_SETTINGS, SETTING_BOUNDS, resolveSettings, type SettingRow } from '../../lib/settings';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -54,6 +56,7 @@ const properties: INodeProperties[] = [
 			{ name: 'Responsibility', value: 'responsibility', description: 'Traverse roles, steps and deciders' },
 			{ name: 'Prompt', value: 'prompt', description: 'Build a system prompt from roleALPHA data' },
 			{ name: 'Schedule', value: 'schedule', description: 'Decide whether a step is due' },
+			{ name: 'Settings', value: 'settings', description: 'Runner limits from defaults and a settings table (global, step, agent)' },
 			{ name: 'Share', value: 'share', description: 'The part of a step that belongs to the agent\'s roles, and what it needs from other roles' },
 			{ name: 'Wait', value: 'wait', description: 'Wait for and wake other agents within one step' },
 		],
@@ -148,6 +151,7 @@ const properties: INodeProperties[] = [
 			{ name: 'Check Approver', value: 'checkApprover', action: 'Check whether a person may decide on a step', description: 'Fail-closed: deciding role first, then the person filling it' },
 			{ name: 'Check Responsibility', value: 'checkResponsibility', action: 'Check whether roles are responsible for a step' },
 			{ name: 'Find Step by Custom ID', value: 'findStep', action: 'Find a step by custom ID' },
+			{ name: 'Get Circle Lead', value: 'getCircleLead', action: 'Get the role leading the circle', description: 'One item per circle of the roles: the leading role and its holders, e.g. to escalate to' },
 			{ name: 'Get Decider', value: 'getDecider', action: 'Get the deciding role and its holders', description: 'DECIDES_ON, else ACCOUNTABLE_FOR' },
 			{ name: 'Get Duties', value: 'getDuties', action: 'Get the steps an agent or roles are responsible for' },
 			{ name: 'Get Role Holders', value: 'getRoleHolders', action: 'Get persons and agents filling a role' },
@@ -178,7 +182,7 @@ const properties: INodeProperties[] = [
 		type: 'string',
 		default: '',
 		description: 'Read the roles this agent fulfils. Leave empty to pass role UUIDs instead.',
-		displayOptions: show('responsibility', ['getDuties', 'checkResponsibility']),
+		displayOptions: show('responsibility', ['getDuties', 'checkResponsibility', 'getCircleLead']),
 	},
 	{
 		displayName: 'Role UUIDs',
@@ -186,7 +190,7 @@ const properties: INodeProperties[] = [
 		type: 'string',
 		default: '',
 		description: 'Comma-separated role UUIDs, or an array via expression. Used when no agent UUID is given.',
-		displayOptions: show('responsibility', ['getDuties', 'checkResponsibility']),
+		displayOptions: show('responsibility', ['getDuties', 'checkResponsibility', 'getCircleLead']),
 	},
 	{
 		displayName: 'Custom ID',
@@ -379,7 +383,8 @@ const properties: INodeProperties[] = [
 		displayOptions: { show: { resource: ['wait'] } },
 		options: [
 			{ name: 'Plan After Run', value: 'planAfterRun', action: 'Plan what follows a run', description: 'Whether the agent waited, which row to add, whom to wake and which rows to remove' },
-			{ name: 'Find Stale Waits', value: 'findStale', action: 'Find waits nobody answered', description: 'For a scheduler: waits older than a limit, e.g. when a person fills the awaited role' },
+			{ name: 'Check Start', value: 'checkStart', action: 'Check whether a run may start', description: 'Duplicate-run guard: after adding this run\'s lease, the oldest live lease wins; a later start is queued' },
+			{ name: 'Find Stale Waits', value: 'findStale', action: 'Find waits nobody answered', description: 'For a scheduler: unanswered waits, orphaned queued starts, dead leases, expired rows and waits to escalate' },
 		],
 		default: 'planAfterRun',
 	},
@@ -398,8 +403,16 @@ const properties: INodeProperties[] = [
 		default: '',
 		required: true,
 		placeholder: '{"runId":"","stepUuid":"","agentUuid":"","roleUuids":[],"recordKeys":[],"startedAt":"","event":{},"attempt":0}',
-		description: 'The run that just ended',
-		displayOptions: show('wait', ['planAfterRun']),
+		description: 'The run that just ended (Plan After Run) or wants to start (Check Start)',
+		displayOptions: show('wait', ['planAfterRun', 'checkStart']),
+	},
+	{
+		displayName: 'Settings Rows',
+		name: 'settingRows',
+		type: 'json',
+		default: '',
+		description: 'Optional rows of the settings table (scope, target, key, value). Limits per agent and step from these rows win over the options below.',
+		displayOptions: { show: { resource: ['wait'] } },
 	},
 	{
 		displayName: 'Options',
@@ -412,7 +425,49 @@ const properties: INodeProperties[] = [
 			{ displayName: 'Max Attempts', name: 'maxAttempts', type: 'number', typeOptions: { minValue: 1 }, default: 5, description: 'How often one agent is woken for the same step and records' },
 			{ displayName: 'Keep Done Rows (Hours)', name: 'keepDoneHours', type: 'number', typeOptions: { minValue: 1 }, default: 168 },
 			{ displayName: 'Older Than (Minutes)', name: 'olderThanMinutes', type: 'number', typeOptions: { minValue: 1 }, default: 60, description: 'Find Stale Waits: only waits at least this old' },
+			{ displayName: 'Run Timeout (Minutes)', name: 'runTimeoutMinutes', type: 'number', typeOptions: { minValue: 1 }, default: 15, description: 'Leases older than this count as dead' },
 		],
+	},
+
+	// ---------------------------------------------------------------- settings
+	{
+		displayName: 'Operation',
+		name: 'operation',
+		type: 'options',
+		noDataExpression: true,
+		displayOptions: { show: { resource: ['settings'] } },
+		options: [{ name: 'Resolve', value: 'resolve', action: 'Resolve runner settings', description: `Defaults < global < step < agent; every value clamped to fixed bounds (${Object.entries(SETTING_BOUNDS).map(([k, b]) => `${k} ${b.min}–${b.max}`).join(', ')})` }],
+		default: 'resolve',
+	},
+	{
+		displayName: 'Settings Rows',
+		name: 'settingRows',
+		type: 'json',
+		default: '',
+		description: 'Rows of the settings table: scope (global, step, agent), target (step UUID or custom ID, agent UUID), key, value. Empty: defaults only.',
+		displayOptions: show('settings', ['resolve']),
+	},
+	{
+		displayName: 'Agent UUID',
+		name: 'settingsAgent',
+		type: 'string',
+		default: '',
+		displayOptions: show('settings', ['resolve']),
+	},
+	{
+		displayName: 'Step',
+		name: 'settingsStep',
+		type: 'string',
+		default: '',
+		description: 'Step UUID',
+		displayOptions: show('settings', ['resolve']),
+	},
+	{
+		displayName: 'Step Custom ID',
+		name: 'settingsStepCustomId',
+		type: 'string',
+		default: '',
+		displayOptions: show('settings', ['resolve']),
 	},
 
 	// ---------------------------------------------------------------- schedule
@@ -642,15 +697,32 @@ export class RoleAlpha implements INodeType {
 			const rows = (Array.isArray(rowsRaw) ? rowsRaw : []).filter((r) => r && typeof r === 'object' && (r as IDataObject).state) as WaitRow[];
 			const opts = this.getNodeParameter('waitOptions', 0, {}) as IDataObject;
 			const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : undefined);
+			const settingRowsRaw = parseJsonParam(this, 'settingRows', 0);
+			const settingRows = (Array.isArray(settingRowsRaw) ? settingRowsRaw : []) as SettingRow[];
+			// The options are the workflow's defaults; table rows (global < step < agent) win. Both are clamped to the same bounds.
+			const optionRows: SettingRow[] = Object.entries({ maxAttempts: opts.maxAttempts, keepDoneHours: opts.keepDoneHours, maxWaitMinutes: opts.olderThanMinutes, runTimeoutMinutes: opts.runTimeoutMinutes })
+				.filter(([, v]) => num(v) !== undefined)
+				.map(([key, value]) => ({ scope: 'global', key, value }));
+			const limitsFor = (t: { agentUuid: string; stepUuid: string; stepCustomId: string }): Limits => {
+				const r = resolveSettings([...optionRows, ...settingRows], t).settings;
+				return { maxAttempts: r.maxAttempts, keepDoneHours: r.keepDoneHours, maxWaitMinutes: r.maxWaitMinutes, runTimeoutMinutes: r.runTimeoutMinutes };
+			};
+			const waitOpts = { ...limitsFor({ agentUuid: '', stepUuid: '', stepCustomId: '' }), limitsFor };
 			if (operation === 'findStale') {
-				const res = findStaleWaits(rows, { maxAttempts: num(opts.maxAttempts), olderThanMinutes: num(opts.olderThanMinutes) });
+				const res = findStaleWaits(rows, waitOpts);
 				return [[{ json: res as unknown as IDataObject }]];
 			}
 			const run = parseJsonParam(this, 'run', 0) as FinishedRun | undefined;
+			if (operation === 'checkStart') {
+				if (!run || !run.runId || !run.stepUuid || !run.agentUuid) {
+					throw new NodeOperationError(this.getNode(), 'Run needs runId, stepUuid and agentUuid');
+				}
+				return [[{ json: checkStart(rows, run, waitOpts) as unknown as IDataObject }]];
+			}
 			if (!run || !run.runId || !run.stepUuid || !run.agentUuid || !run.startedAt) {
 				throw new NodeOperationError(this.getNode(), 'Finished Run needs runId, stepUuid, agentUuid and startedAt');
 			}
-			const plan = planAfterRun(rows, run, { maxAttempts: num(opts.maxAttempts), keepDoneHours: num(opts.keepDoneHours) });
+			const plan = planAfterRun(rows, run, waitOpts);
 			return [[{ json: plan as unknown as IDataObject }]];
 		}
 
@@ -720,6 +792,8 @@ export class RoleAlpha implements INodeType {
 						const duties = await getDuties(g, await roleUuidsFor());
 						if (opts.splitDuties === false) out.push({ json: { duties } as unknown as IDataObject, pairedItem: { item: i } });
 						else for (const d of duties) out.push({ json: d as unknown as IDataObject, pairedItem: { item: i } });
+					} else if (operation === 'getCircleLead') {
+						for (const lead of await getCircleLeads(g, await roleUuidsFor())) out.push({ json: lead as unknown as IDataObject, pairedItem: { item: i } });
 					} else if (operation === 'getRoleHolders') {
 						const roleUuid = this.getNodeParameter('roleUuid', i) as string;
 						out.push({ json: { roleUuid, ...(await getRoleHolders(g, roleUuid)) } as unknown as IDataObject, pairedItem: { item: i } });
@@ -786,6 +860,17 @@ export class RoleAlpha implements INodeType {
 						if (answer && typeof answer === 'object' && (answer as IDataObject).output && typeof (answer as IDataObject).output === 'object') answer = (answer as IDataObject).output;
 						out.push({ json: checkShare(input, answer) as unknown as IDataObject, pairedItem: { item: i } });
 					}
+					continue;
+				}
+
+				if (resource === 'settings') {
+					const raw = parseJsonParam(this, 'settingRows', i);
+					const res = resolveSettings((Array.isArray(raw) ? raw : []) as SettingRow[], {
+						agentUuid: String(this.getNodeParameter('settingsAgent', i, '') ?? ''),
+						stepUuid: String(this.getNodeParameter('settingsStep', i, '') ?? ''),
+						stepCustomId: String(this.getNodeParameter('settingsStepCustomId', i, '') ?? ''),
+					});
+					out.push({ json: { ...items[i].json, settings: res.settings, settingSources: res.sources, settingProblems: res.problems, settingDefaults: DEFAULT_SETTINGS } as unknown as IDataObject, pairedItem: { item: i } });
 					continue;
 				}
 

@@ -1,6 +1,6 @@
 {
   "name": "n8n-nodes-rolealpha",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "n8n nodes for running AI agents whose roles, duties, deciders and guardrails live in roleALPHA",
   "keywords": [
     "n8n-community-node-package",
@@ -13,6 +13,14 @@
   "private": true,
   "author": {
     "name": "roleALPHA GmbH"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/roleALPHA/n8n-nodes-rolealpha.git"
+  },
+  "homepage": "https://github.com/roleALPHA/n8n-nodes-rolealpha#readme",
+  "bugs": {
+    "url": "https://github.com/roleALPHA/n8n-nodes-rolealpha/issues"
   },
   "files": [
     "dist"

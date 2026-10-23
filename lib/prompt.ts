@@ -65,7 +65,7 @@ export function shareRules(share: ShareResult): string[] {
 function shareBlock(share: ShareResult): string[] {
 	const out = ['', '# Your part of this step'];
 	share.duties.forEach((d, n) => {
-		out.push(`${n + 1}. ${d.task} (accountability of ${d.role}: ${d.accountability})`);
+		out.push(`${n + 1}. ${d.task} (accountability of ${d.role}: ${d.accountability})${d.handover ? ' – closes the step: do it last, only when every other part of the step is there' : ''}`);
 		for (const need of d.needs) out.push(`   Needs first from ${need.role}: ${need.what}`);
 	});
 	if (share.notMine.length) {
@@ -79,7 +79,9 @@ function shareBlock(share: ShareResult): string[] {
 export function buildTask(input: { step: Pick<Step, 'name'>; share: ShareResult; triggerType?: string }): string {
 	const { step, share } = input;
 	const lines = [`Work now on your part of the step "${step.name}" (trigger: ${input.triggerType || 'manual'}). Your part, and only this:`];
-	share.duties.forEach((d, n) => lines.push(`${n + 1}. ${d.task}${d.needs.length ? ` (needs first: ${d.needs.map((x) => `${x.role}: ${x.what}`).join('; ')})` : ''}`));
+	share.duties.forEach((d, n) =>
+		lines.push(`${n + 1}. ${d.task}${d.handover ? ' [closes the step, do it last]' : ''}${d.needs.length ? ` (needs first: ${d.needs.map((x) => `${x.role}: ${x.what}`).join('; ')})` : ''}`),
+	);
 	if (share.notMine.length) lines.push('', 'Not your part (other roles do it, do not do it):', ...share.notMine.map((t) => `- ${t}`));
 	lines.push('', `If a result you need from another role is missing, do what you can without it, then call "${WAIT_TOOL}". Follow the rules and guardrails, then report.`);
 	return lines.join('\n');

@@ -292,6 +292,57 @@ export async function getCircle(src: GraphSource, roleUuid: string): Promise<Ent
 	return null;
 }
 
+export interface CircleLead {
+	circle: EntityRef;
+	/** The role that leads the circle, with its holders; null when the circle names none. */
+	lead: RoleRef | null;
+	/** How the lead was recognised. */
+	basis: 'flag' | 'lead-link' | 'custom-id' | 'decides-on-circle' | null;
+	/** The agent's roles in this circle. */
+	roles: EntityRef[];
+}
+
+const LEAD_SUBTYPES = new Set(['lead', 'lead_link', 'lead-link', 'lead link', 'circle_lead']);
+
+/**
+ * The role that leads the circle of each given role, read from roleALPHA at run time:
+ * a role inside the circle flagged as lead (leadLink / lead / subtype), else one whose purpose
+ * names it the Lead Link, else one whose custom ID ends in ":lead", else a role that decides on
+ * or is accountable for the circle itself. Persons first, agents after, as holders.
+ */
+export async function getCircleLeads(src: GraphSource, roleUuids: string[]): Promise<CircleLead[]> {
+	const byCircle = new Map<string, CircleLead>();
+	for (const roleUuid of Array.from(new Set(roleUuids))) {
+		const circle = await getCircle(src, roleUuid);
+		if (!circle) continue;
+		const known = byCircle.get(circle.uuid);
+		const role = await src.details(roleUuid);
+		if (known) {
+			known.roles.push({ uuid: role.uuid, name: role.name, entityType: role.entityType });
+			continue;
+		}
+		const rels = await src.relationships(circle.uuid);
+		const members = edges(rels, 'IS_IMPLEMENTED_BY', 'outgoing');
+		const details = await Promise.all(members.map((m) => src.details(m.uuid)));
+		const pick = (test: (d: EntityDetails) => boolean) => details.find(test) ?? null;
+		let basis: CircleLead['basis'] = null;
+		let found: EntityDetails | null = pick((d) => d.data.leadLink === true || d.data.lead === true || LEAD_SUBTYPES.has(String(d.data.subtype ?? '').toLowerCase()));
+		if (found) basis = 'flag';
+		if (!found && (found = pick((d) => /\blead[\s-]?link\b/i.test(String(d.data.purpose ?? ''))))) basis = 'lead-link';
+		if (!found && (found = pick((d) => /(^|:)lead$/i.test(String(d.customId ?? ''))))) basis = 'custom-id';
+		if (!found) {
+			const deciding = [...edges(rels, 'DECIDES_ON', 'incoming'), ...edges(rels, 'ACCOUNTABLE_FOR', 'incoming')].filter((r) => !isPersonType(r.entityType ?? ''));
+			if (deciding.length > 0) {
+				found = await src.details(deciding[0].uuid);
+				basis = 'decides-on-circle';
+			}
+		}
+		const lead: RoleRef | null = found ? { uuid: found.uuid, name: found.name, entityType: found.entityType, holders: await getRoleHolders(src, found.uuid) } : null;
+		byCircle.set(circle.uuid, { circle, lead, basis, roles: [{ uuid: role.uuid, name: role.name, entityType: role.entityType }] });
+	}
+	return Array.from(byCircle.values());
+}
+
 async function withHolders(src: GraphSource, roles: EntityRef[]): Promise<RoleRef[]> {
 	const out: RoleRef[] = [];
 	for (const role of roles) out.push({ ...role, holders: await getRoleHolders(src, role.uuid) });
