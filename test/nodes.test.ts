@@ -40,7 +40,7 @@ const bundle = (status: string, guardrails = 1) => ({
 const keysCreds = { baseUrl: 'https://data.example.com/', keys: JSON.stringify({ [AGENT]: 'agt_secret' }) };
 
 test('Get Context sends the agent key and summarizes the bundle', async () => {
-	const { ctx, calls } = execCtx({ resource: 'agent', operation: 'getContext', agentUuid: AGENT.toUpperCase(), agentOptions: {} }, keysCreds, () => bundle('active'));
+	const { ctx, calls } = execCtx({ resource: 'agent', source: 'agentKey', operation: 'getContext', agentUuid: AGENT.toUpperCase(), agentOptions: {} }, keysCreds, () => bundle('active'));
 	const [[item]] = await new RoleAlpha().execute.call(ctx);
 	assert.equal(calls[0].url, `https://data.example.com/api/agents/${AGENT}/context`);
 	assert.equal(calls[0].headers['x-agent-key'], 'agt_secret');
@@ -49,17 +49,77 @@ test('Get Context sends the agent key and summarizes the bundle', async () => {
 });
 
 test('Get Context fails closed for inactive agents and agents without guardrails', async () => {
-	const inactive = execCtx({ resource: 'agent', operation: 'getContext', agentUuid: AGENT, agentOptions: {} }, keysCreds, () => bundle('draft'));
+	const inactive = execCtx({ resource: 'agent', source: 'agentKey', operation: 'getContext', agentUuid: AGENT, agentOptions: {} }, keysCreds, () => bundle('draft'));
 	await assert.rejects(new RoleAlpha().execute.call(inactive.ctx), /not active/);
-	const bare = execCtx({ resource: 'agent', operation: 'getContext', agentUuid: AGENT, agentOptions: {} }, keysCreds, () => bundle('active', 0));
+	const bare = execCtx({ resource: 'agent', source: 'agentKey', operation: 'getContext', agentUuid: AGENT, agentOptions: {} }, keysCreds, () => bundle('active', 0));
 	await assert.rejects(new RoleAlpha().execute.call(bare.ctx), /no policy/);
-	const unknown = execCtx({ resource: 'agent', operation: 'getContext', agentUuid: 'eb2d0919-2cdb-4694-ab5d-e72a97c7b2c7', agentOptions: {} }, keysCreds);
+	const unknown = execCtx({ resource: 'agent', source: 'agentKey', operation: 'getContext', agentUuid: 'eb2d0919-2cdb-4694-ab5d-e72a97c7b2c7', agentOptions: {} }, keysCreds);
 	await assert.rejects(new RoleAlpha().execute.call(unknown.ctx), /No key/);
 });
 
 test('List Configured Agents skips inactive agents', async () => {
-	const { ctx } = execCtx({ resource: 'agent', operation: 'listAgents', agentOptions: {} }, keysCreds, () => bundle('retired'));
+	const { ctx } = execCtx({ resource: 'agent', source: 'agentKey', operation: 'listAgents', agentOptions: {} }, keysCreds, () => bundle('retired'));
 	assert.deepEqual(await new RoleAlpha().execute.call(ctx), [[]]);
+});
+
+/** Fake roleALPHA MCP endpoint behind httpRequestWithAuthentication. Tools answer from `tools`. */
+function mcpCtx(params: Record<string, unknown>, tools: Record<string, (args: any) => unknown>) {
+	const toolCalls: Array<{ name: string; args: any }> = [];
+	const credentialTypes: string[] = [];
+	const { ctx } = execCtx(params, {});
+	ctx.helpers.httpRequestWithAuthentication = async (type: string, opts: any) => {
+		credentialTypes.push(type);
+		const msg = JSON.parse(opts.body);
+		if (msg.id === undefined) return { statusCode: 202, headers: {}, body: '' };
+		let result: unknown = {};
+		if (msg.method === 'tools/call') {
+			toolCalls.push({ name: msg.params.name, args: msg.params.arguments });
+			result = { content: [{ type: 'text', text: JSON.stringify(tools[msg.params.name](msg.params.arguments)) }] };
+		}
+		return { statusCode: 200, headers: { 'mcp-session-id': 's1' }, body: JSON.stringify({ jsonrpc: '2.0', id: msg.id, result }) };
+	};
+	return { ctx, toolCalls, credentialTypes };
+}
+
+const mcpParams = { resource: 'agent', endpointUrl: 'https://ra.example.com/api/mcp', organisation: 'org-1', agentOptions: {} };
+
+test('Get Context over MCP reads the agent view without an agent key', async () => {
+	const { ctx, toolCalls, credentialTypes } = mcpCtx({ ...mcpParams, operation: 'getContext', agentUuid: AGENT.toUpperCase() }, { get_agent_context: () => bundle('active') });
+	const [[item]] = await new RoleAlpha().execute.call(ctx);
+	assert.deepEqual(toolCalls, [{ name: 'get_agent_context', args: { agent_uuid: AGENT, organisation: 'org-1', view: 'agent' } }]);
+	assert.ok(credentialTypes.every((t) => t === 'mcpOAuth2Api'));
+	assert.equal(item.json.agentName, 'Assistant');
+	assert.equal(item.json.contextVersion, 'v1');
+});
+
+test('Get Context over MCP fails closed like the agent key path', async () => {
+	const inactive = mcpCtx({ ...mcpParams, operation: 'getContext', agentUuid: AGENT }, { get_agent_context: () => bundle('paused') });
+	await assert.rejects(new RoleAlpha().execute.call(inactive.ctx), /not active/);
+	const bare = mcpCtx({ ...mcpParams, operation: 'getContext', agentUuid: AGENT }, { get_agent_context: () => bundle('active', 0) });
+	await assert.rejects(new RoleAlpha().execute.call(bare.ctx), /no policy/);
+});
+
+test('List Agents over MCP pages through the organisation and keeps only active agents', async () => {
+	const OTHER = 'eb2d0919-2cdb-4694-ab5d-e72a97c7b2c7';
+	const DRAFT = 'd51abf32-c237-4d60-9536-9ba71d548d56';
+	const pages: Record<number, unknown> = {
+		0: { agents: [{ uuid: AGENT, name: 'Assistant', customerId: 'x:assistant', summary: 'Assistant | active' }, { uuid: DRAFT, name: 'Draft', summary: 'Draft | draft' }], hasMore: true, nextOffset: 2 },
+		2: { agents: [{ uuid: OTHER, name: 'Coach', status: 'active' }], hasMore: false, nextOffset: null },
+	};
+	const { ctx, toolCalls } = mcpCtx({ ...mcpParams, operation: 'listAgents', agentOptions: { includeContext: false } }, { search_agents: (a) => pages[a.offset] });
+	const [items] = await new RoleAlpha().execute.call(ctx);
+	assert.deepEqual(items.map((i: any) => i.json.agentUuid), [AGENT, OTHER]);
+	assert.equal(items[0].json.customId, 'x:assistant');
+	assert.deepEqual(toolCalls.map((c) => c.args.offset), [0, 2]);
+});
+
+test('List Agents over MCP drops agents whose context is not active', async () => {
+	const { ctx, toolCalls } = mcpCtx({ ...mcpParams, operation: 'listAgents' }, {
+		search_agents: () => ({ agents: [{ uuid: AGENT, name: 'Assistant', summary: 'Assistant | active' }], hasMore: false }),
+		get_agent_context: () => bundle('retired'),
+	});
+	assert.deepEqual(await new RoleAlpha().execute.call(ctx), [[]]);
+	assert.deepEqual(toolCalls.map((c) => c.name), ['search_agents', 'get_agent_context']);
 });
 
 test('Build System Prompt accepts the Get Context output', async () => {

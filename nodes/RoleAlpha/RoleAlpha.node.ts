@@ -20,6 +20,7 @@ import {
 	responsibleRolesFor,
 	type GraphSource,
 } from '../../lib/graph';
+import { getAgentContext, listAgents, type ContextView } from '../../lib/agents';
 import { keyFor, parseKeyring, type AgentKey } from '../../lib/keys';
 import { buildSystemPrompt, type ContextBundle } from '../../lib/prompt';
 import { isDue } from '../../lib/schedule';
@@ -46,7 +47,7 @@ const properties: INodeProperties[] = [
 		type: 'options',
 		noDataExpression: true,
 		options: [
-			{ name: 'Agent', value: 'agent', description: 'Read the agent\'s own context with its agent key' },
+			{ name: 'Agent', value: 'agent', description: 'Read an agent\'s context and list the agents of the organisation' },
 			{ name: 'Responsibility', value: 'responsibility', description: 'Traverse roles, steps and deciders' },
 			{ name: 'Prompt', value: 'prompt', description: 'Build a system prompt from roleALPHA data' },
 			{ name: 'Schedule', value: 'schedule', description: 'Decide whether a step is due' },
@@ -63,10 +64,22 @@ const properties: INodeProperties[] = [
 		displayOptions: { show: { resource: ['agent'] } },
 		options: [
 			{ name: 'Get Context', value: 'getContext', action: 'Get the context of an agent', description: 'Identity, roles and guardrails of one agent' },
-			{ name: 'Get Context Version', value: 'getContextVersion', action: 'Get the context version of an agent', description: 'Cheap change check, not audited' },
-			{ name: 'List Configured Agents', value: 'listAgents', action: 'List configured agents', description: 'One item per agent key in the credential' },
+			{ name: 'Get Context Version', value: 'getContextVersion', action: 'Get the context version of an agent', description: 'Change check; cheap and not audited with agent keys' },
+			{ name: 'List Agents', value: 'listAgents', action: 'List agents', description: 'One item per agent of the organisation (MCP) or per key in the credential' },
 		],
 		default: 'getContext',
+	},
+	{
+		displayName: 'Source',
+		name: 'source',
+		type: 'options',
+		noDataExpression: true,
+		displayOptions: { show: { resource: ['agent'] } },
+		options: [
+			{ name: 'MCP (OAuth2)', value: 'mcp', description: 'One connection for all agents of the organisation; new agents run without extra setup' },
+			{ name: 'Agent Keys', value: 'agentKey', description: 'One agt_ key per agent, read over the data API' },
+		],
+		default: 'mcp',
 	},
 	{
 		displayName: 'Agent UUID',
@@ -103,7 +116,18 @@ const properties: INodeProperties[] = [
 				name: 'includeContext',
 				type: 'boolean',
 				default: true,
-				description: 'Whether List Configured Agents loads each context (name, status, roles)',
+				description: 'Whether List Agents loads each context (status, roles, guardrails)',
+			},
+			{
+				displayName: 'View',
+				name: 'view',
+				type: 'options',
+				options: [
+					{ name: 'Agent', value: 'agent', description: 'Exactly the bundle the agent receives over its own key (needs admin rights on the tenant)' },
+					{ name: 'Caller', value: 'caller', description: 'The bundle as visible through the connection\'s own permissions' },
+				],
+				default: 'agent',
+				description: 'MCP only: which view of the context bundle to read',
 			},
 		],
 	},
@@ -132,7 +156,7 @@ const properties: INodeProperties[] = [
 		type: 'string',
 		default: 'https://rolealpha.app/api/mcp',
 		required: true,
-		displayOptions: { show: { resource: ['responsibility'] } },
+		displayOptions: { show: { resource: ['agent', 'responsibility'] }, hide: { source: ['agentKey'] } },
 	},
 	{
 		displayName: 'Organisation',
@@ -140,8 +164,8 @@ const properties: INodeProperties[] = [
 		type: 'string',
 		default: '',
 		required: true,
-		description: 'Organisation (tenant) name as roleALPHA knows it',
-		displayOptions: { show: { resource: ['responsibility'] } },
+		description: 'Organisation (tenant) name or ID as roleALPHA knows it',
+		displayOptions: { show: { resource: ['agent', 'responsibility'] }, hide: { source: ['agentKey'] } },
 	},
 	{
 		displayName: 'Agent UUID',
@@ -378,7 +402,7 @@ function summarizeBundle(bundle: ContextBundle): IDataObject {
 	};
 }
 
-function graphFor(ctx: IExecuteFunctions, endpointUrl: string, organisation: string): GraphSource {
+function mcpClientFor(ctx: IExecuteFunctions, endpointUrl: string): McpClient {
 	const transport = async (body: unknown, headers: Record<string, string>): Promise<HttpReply> => {
 		try {
 			const res = (await ctx.helpers.httpRequestWithAuthentication.call(ctx, 'mcpOAuth2Api', {
@@ -397,7 +421,7 @@ function graphFor(ctx: IExecuteFunctions, endpointUrl: string, organisation: str
 			return { status: Number(e.httpCode) || 500, headers: {}, body: String(e.description ?? e.message ?? 'request failed') };
 		}
 	};
-	return new McpGraphSource(new McpClient(transport), organisation);
+	return new McpClient(transport);
 }
 
 async function resolveStepUuid(ctx: IExecuteFunctions, graph: GraphSource, value: string, i: number): Promise<string> {
@@ -424,8 +448,8 @@ export class RoleAlpha implements INodeType {
 		inputs: [NodeConnectionTypes.Main],
 		outputs: [NodeConnectionTypes.Main],
 		credentials: [
-			{ name: 'roleAlphaAgentKeysApi', required: true, displayOptions: { show: { resource: ['agent'] } } },
-			{ name: 'mcpOAuth2Api', required: true, displayOptions: { show: { resource: ['responsibility'] } } },
+			{ name: 'roleAlphaAgentKeysApi', required: true, displayOptions: { show: { resource: ['agent'], source: ['agentKey'] } } },
+			{ name: 'mcpOAuth2Api', required: true, displayOptions: { show: { resource: ['agent', 'responsibility'] }, hide: { source: ['agentKey'] } } },
 		],
 		properties,
 	};
@@ -436,9 +460,10 @@ export class RoleAlpha implements INodeType {
 		const resource = this.getNodeParameter('resource', 0) as string;
 		const operation = this.getNodeParameter('operation', 0) as string;
 
+		const source = resource === 'agent' ? (this.getNodeParameter('source', 0, 'mcp') as string) || 'mcp' : '';
 		let keyring: AgentKey[] = [];
 		let baseUrl = '';
-		if (resource === 'agent') {
+		if (source === 'agentKey') {
 			const creds = await this.getCredentials('roleAlphaAgentKeysApi');
 			baseUrl = String(creds.baseUrl ?? '');
 			try {
@@ -448,14 +473,42 @@ export class RoleAlpha implements INodeType {
 			}
 		}
 
-		// One graph (and MCP session + cache) per execution keeps traversals consistent and cheap.
+		// One MCP session (and graph cache) per execution keeps traversals consistent and cheap.
+		let client: McpClient | undefined;
 		let graph: GraphSource | undefined;
-		const getGraph = (i: number) => {
-			if (!graph) {
-				graph = graphFor(this, this.getNodeParameter('endpointUrl', i) as string, this.getNodeParameter('organisation', i) as string);
-			}
-			return graph;
+		const organisationAt = (i: number) => String(this.getNodeParameter('organisation', i) ?? '').trim();
+		const getClient = (i: number) => (client ??= mcpClientFor(this, this.getNodeParameter('endpointUrl', i) as string));
+		const getGraph = (i: number) => (graph ??= new McpGraphSource(getClient(i), organisationAt(i)));
+
+		// Reads one context bundle from the chosen source.
+		const loadBundle = async (agentUuid: string, i: number, opts: IDataObject): Promise<ContextBundle> => {
+			if (source === 'agentKey') return (await agentRequest(this, baseUrl, keyring, agentUuid, '/context')) as unknown as ContextBundle;
+			const uuid = agentUuid.trim().toLowerCase();
+			if (!UUID.test(uuid)) throw new NodeOperationError(this.getNode(), `Not an agent UUID: "${agentUuid}"`, { itemIndex: i });
+			return getAgentContext(getClient(i), organisationAt(i), uuid, ((opts.view as string) || 'agent') as ContextView);
 		};
+
+		if (resource === 'agent' && operation === 'listAgents' && source === 'mcp') {
+			const opts = this.getNodeParameter('agentOptions', 0, {}) as IDataObject;
+			const includeContext = opts.includeContext !== false;
+			const requireActive = opts.requireActive !== false;
+			for (const entry of await listAgents(getClient(0), organisationAt(0))) {
+				// Inactive agents are skipped early; Get Context checks the status again (fail closed).
+				if (requireActive && entry.status !== 'active') continue;
+				const row: IDataObject = { ...entry };
+				if (includeContext) {
+					try {
+						Object.assign(row, summarizeBundle(await loadBundle(entry.agentUuid, 0, opts)));
+					} catch (error) {
+						if (!this.continueOnFail()) throw error;
+						row.error = (error as Error).message;
+					}
+					if (requireActive && row.status !== 'active' && !row.error) continue;
+				}
+				out.push({ json: row });
+			}
+			return [out];
+		}
 
 		if (resource === 'agent' && operation === 'listAgents') {
 			const opts = this.getNodeParameter('agentOptions', 0, {}) as IDataObject;
@@ -483,12 +536,17 @@ export class RoleAlpha implements INodeType {
 				if (resource === 'agent') {
 					const agentUuid = this.getNodeParameter('agentUuid', i) as string;
 					if (operation === 'getContextVersion') {
-						const res = await agentRequest(this, baseUrl, keyring, agentUuid, '/context/version');
-						out.push({ json: { agentUuid: agentUuid.trim().toLowerCase(), ...res }, pairedItem: { item: i } });
+						if (source === 'agentKey') {
+							const res = await agentRequest(this, baseUrl, keyring, agentUuid, '/context/version');
+							out.push({ json: { agentUuid: agentUuid.trim().toLowerCase(), ...res }, pairedItem: { item: i } });
+						} else {
+							const b = await loadBundle(agentUuid, i, {});
+							out.push({ json: { agentUuid: agentUuid.trim().toLowerCase(), contextVersion: b.contextVersion ?? null }, pairedItem: { item: i } });
+						}
 						continue;
 					}
 					const opts = this.getNodeParameter('agentOptions', i, {}) as IDataObject;
-					const bundle = (await agentRequest(this, baseUrl, keyring, agentUuid, '/context')) as unknown as ContextBundle;
+					const bundle = await loadBundle(agentUuid, i, opts);
 					const summary = summarizeBundle(bundle);
 					if (opts.requireActive !== false && summary.status !== 'active') {
 						throw new NodeOperationError(this.getNode(), `Agent ${summary.agentName ?? agentUuid} is not active in roleALPHA (status: ${summary.status ?? 'unknown'})`, { itemIndex: i });

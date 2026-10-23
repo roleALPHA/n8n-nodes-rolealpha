@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { agentStatus } from '../lib/agents';
 import { McpClient, parseRpcBody, unwrapToolResult, type HttpReply } from '../lib/mcp';
 import { canonicalJson, legacySeal, signSeal, verifySeal } from '../lib/seal';
 import { parseEvent, parseSecrets, signBody, verifySignature } from '../lib/webhook';
@@ -167,4 +168,11 @@ test('buildSystemPrompt is built only from roleALPHA data', async () => {
 		assert.ok(prompt.includes(part), `missing: ${part}`);
 	}
 	assert.ok(!prompt.includes('Instructions:'), 'empty instructions are left out');
+});
+
+test('agentStatus reads status or the last part of the summary', () => {
+	assert.equal(agentStatus({ status: 'Active' }), 'active');
+	assert.equal(agentStatus({ summary: 'MS Teams Assistenz | active' }), 'active');
+	assert.equal(agentStatus({ summary: 'No status here' }), null);
+	assert.equal(agentStatus({}), null);
 });

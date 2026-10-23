@@ -10,9 +10,9 @@ n8n nodes for **generic agent runners**. One workflow runs every agent. Each age
 
 | Resource | Operation | What it does | Credential |
 |---|---|---|---|
-| Agent | Get Context | Reads the agent's own context bundle (identity, roles, guardrails). Fails if the agent is not `active` or has no policy, unless you switch that off. | roleALPHA Agent Keys API |
-| Agent | Get Context Version | Cheap change check. Not audited. | roleALPHA Agent Keys API |
-| Agent | List Configured Agents | Returns one item per key in the credential. By default it skips agents that are not active. | roleALPHA Agent Keys API |
+| Agent | Get Context | Reads an agent's context bundle (identity, roles, guardrails). Fails if the agent is not `active` or has no policy, unless you switch that off. Over MCP it reads the `agent` view by default, exactly what the agent gets over its own key. | MCP OAuth2 (default) or roleALPHA Agent Keys API |
+| Agent | Get Context Version | Change check. Cheap and not audited with agent keys; over MCP it reads the bundle. | MCP OAuth2 or roleALPHA Agent Keys API |
+| Agent | List Agents | Over MCP: every agent of the organisation, paged. With agent keys: one item per key. By default it skips agents that are not active. | MCP OAuth2 or roleALPHA Agent Keys API |
 | Responsibility | Get Duties | Lists the steps the agent's roles are `RESPONSIBLE_FOR`, with the circle. | MCP OAuth2 |
 | Responsibility | Find Step by Custom ID | Looks up a step by an exact custom ID. | MCP OAuth2 |
 | Responsibility | Get Step | Returns a step with its predecessors, successors, parent and child steps, responsible, deciding and accountable roles (with their holders), and policies. | MCP OAuth2 |
@@ -38,10 +38,10 @@ Receives `context.changed` webhooks. It checks `X-RA-Signature: sha256=<hmac>` a
 
 | Credential | Content |
 |---|---|
-| **roleALPHA Agent Keys API** | `baseUrl` of the data node, and `keys`: `{"<agent uuid>": "agt_…"}`, or a list of `{agentUuid, key, label}`. **Adding a key is all it takes for a new agent to run**: the scheduler picks it up on its next tick. |
+| **roleALPHA Agent Keys API** | Optional, for the `Agent Keys` source. `baseUrl` of the data node, and `keys`: `{"<agent uuid>": "agt_…"}`, or a list of `{agentUuid, key, label}`. |
 | **roleALPHA Webhook API** | One signing secret, a JSON list of secrets, or a map from agent UUID to secret. |
 | **Approval Seal API** | `key` (sign and verify) and optionally `legacyKey` (verify v2 only). |
-| **MCP OAuth2** (n8n built-in) | Access to the roleALPHA MCP endpoint, used for traversal. An agent key can read only its own agent, so it cannot traverse. |
+| **MCP OAuth2** (n8n built-in) | Access to the roleALPHA MCP endpoint for one organisation. Used for agents (default source) and traversal. **A new agent runs as soon as it is `active` in roleALPHA**: the scheduler finds it on its next tick. The `agent` view needs admin rights on the tenant. An agent key can read only its own agent, so it cannot traverse. |
 
 Agent keys and webhook secrets are issued in the roleALPHA UI and shown only once. Store them nowhere except in these credentials.
 
@@ -49,7 +49,7 @@ Agent keys and webhook secrets are issued in the roleALPHA UI and shown only onc
 
 ```
 Scheduler (cron)                        Event router (one webhook)
- └ roleALPHA: List Configured Agents     └ map (collection, status) → step custom ID
+ └ roleALPHA: List Agents                └ map (collection, status) → step custom ID
    └ roleALPHA: Get Duties                 └ roleALPHA: Get Step → responsible role → active agent
      └ roleALPHA: Is Due (last runs)         ┘
        └──────────────► Runner(agentUuid, step, trigger, event)
