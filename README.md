@@ -1,8 +1,118 @@
 # n8n-nodes-rolealpha
 
-n8n nodes for **generic agent runners**. One workflow runs every agent. Each agent's identity, roles, duties, deciders and guardrails are read from roleALPHA at run time. Nothing about persons, roles or process steps is hard-coded in n8n.
+<p align="center"><b>AI agents that know only themselves.</b><br>
+Roles, duties, deciders and guardrails come from roleALPHA, at run time, every time.</p>
 
-> Principle: an agent knows only itself. Everything else is found by traversing the graph. Look up the role first, then the person filling it.
+<p align="center">
+  <a href="https://github.com/roleALPHA/n8n-nodes-rolealpha"><b>GitHub</b></a> &nbsp;·&nbsp;
+  <a href="#installation-self-hosted-n8n">Installation</a> &nbsp;·&nbsp;
+  <a href="#nodes">Node reference</a> &nbsp;·&nbsp;
+  <a href="#security">Security</a> &nbsp;·&nbsp;
+  <a href="LICENSE">Licence</a>
+</p>
+
+<p align="center">
+  <a href="package.json"><img
+    alt="Version"
+    src="https://img.shields.io/github/package-json/v/roleALPHA/n8n-nodes-rolealpha?label=version&color=7c3aed"></a>
+  <a href="LICENSE"><img
+    alt="Licence: MIT"
+    src="https://img.shields.io/badge/licence-MIT-7c3aed"></a>
+  <a href="https://docs.n8n.io/integrations/community-nodes/"><img
+    alt="n8n community nodes"
+    src="https://img.shields.io/badge/n8n-community%20nodes-7c3aed?logo=n8n&logoColor=white"></a>
+</p>
+
+You know the moment: somebody new takes over approvals, a role is cut in two, a process gets
+one more step. Then every agent that has a name, an e-mail address or a process ID baked
+into its prompt or its workflow is wrong, and nobody notices until something goes to the
+wrong person. These nodes are built so that this cannot happen. An agent knows its own
+identity and nothing else. What it does, who it hands over to, who decides and which rules
+bind it, it reads from roleALPHA on every run. Change the organisation in roleALPHA, and the
+next run follows. You don't edit code and you don't republish anything.
+
+## At a glance
+
+- **One runner for every agent.** A single n8n workflow runs any agent on any step. A new
+  agent runs as soon as it is `active` in roleALPHA. The scheduler picks it up on its next
+  tick.
+- **Nothing hard-coded.** No persons, no roles, no process IDs in workflows or prompts. Only
+  technology stays fixed: systems, collections, fields, status values and step custom IDs.
+- **Fail-closed.** If roleALPHA cannot be read, or nobody fills the deciding role, the answer
+  is "not allowed". It never falls back to a fixed person.
+- **Agents never approve.** Approvals are checked against the person filling the deciding
+  role and sealed. The channel that sends verifies the seal right before anything leaves.
+- **Teams of agents on one step.** Several roles share a step. Each agent does its own part,
+  waits for what it needs and is woken when it arrives. Agents that hang are escalated to
+  the role that leads their circle.
+- **Limits you can change without republishing.** Retries, wait times, run time and tool
+  calls come from a settings table and are clamped to fixed bounds.
+
+> **In use, not on npm.** The package runs in production on a self-hosted n8n. It is marked
+> `private` and installed from a tarball. See [Installation](#installation-self-hosted-n8n).
+
+## Why it works
+
+**The graph is the job description.** The runner starts with an agent and a step. It reads
+the agent's roles (`AGENT_FULFILLS_ROLE`) and the steps those roles are `RESPONSIBLE_FOR`.
+It reads the step's predecessors and successors (`DEPENDS_ON`), and who decides on it
+(`DECIDES_ON`, else `ACCOUNTABLE_FOR`). From that it builds the system prompt. The agent
+itself carries only identity and technology. Its work comes from the purpose and
+accountabilities of its roles. Change the role, and the work changes.
+
+**The role first, then the person.** Who decides is a role. Who fills it, a person
+(`EXECUTES`) or an agent, is read only after that. Only persons can approve. An agent that
+fills a deciding role is ignored on purpose. The address a person signs in with must match
+their e-mail in roleALPHA. A display name or a claim by the model never counts.
+
+**Each agent does only its own part.** One step can hold many tasks: research, text, visual,
+hand-over. Before a run, **Share** asks a model which of the step's tasks belong to this
+agent's roles. **Share → Check** then keeps only duties that really are accountabilities of
+those roles, and needs on roles that really sit on the step. The agent gets its part, a
+list of what is not its part, and the rules for waiting.
+
+**Waiting is part of the job.** If the text is not there yet, the visual cannot be drawn.
+The agent does what it can, records a wait and stops. When the role it waited for finishes
+a run, **Wait → Plan After Run** wakes it again. A duty that closes the step always waits
+for every other filled role of the step.
+
+**No double runs, no double wake-ups.** Every run takes a lease first. A second start for
+the same agent, step and records is queued, not run. Every wake-up claims its row before it
+fires, so two runs that plan at the same moment never wake an agent twice. If a run fails
+or dies, its lease is released, and the queued start runs.
+
+**Nobody waits forever.** The scheduler finds waits that nobody answered and wakes them
+again. At the attempt limit it stops waking and escalates once to the role that leads the
+circle. The message names that role first, then the people filling it.
+
+**Event data is data.** Whatever a trigger delivers (a status change, a comment, a message)
+goes into the prompt marked as data, never as instructions. Guardrails take precedence over
+event content, and texts that one agent leaves for another are cut to fixed sizes.
+
+## How a run works
+
+```
+Scheduler (cron)                        Event router (one webhook)
+ └ roleALPHA: List Agents                └ map (collection, status) → step custom ID
+   └ roleALPHA: Get Duties                 └ roleALPHA: Get Step → responsible role → active agent
+     └ roleALPHA: Is Due (last runs)         ┘
+       └──────────────► Runner(agentUuid, step, trigger, event)
+                          ├ roleALPHA: Get Context          (active + guardrails, fail-closed)
+                          ├ roleALPHA: Check Responsibility (fail-closed)
+                          ├ roleALPHA: Get Step
+                          ├ Settings: Resolve               (limits from the settings table)
+                          ├ Wait: Check Start               (lease, duplicate-run guard)
+                          ├ Share: Build Input → model → Share: Check (cached)
+                          ├ roleALPHA: Build System Prompt
+                          ├ AI Agent (+ data tool limited to the domains of the agent's roles)
+                          └ Wait: Plan After Run            (done row, wake-ups, lease released)
+
+Scheduler, every tick
+ └ Wait: Find Stale Waits → wake (claimed) · remove dead leases · escalate → Get Circle Lead
+```
+
+Approval gates follow this order: **Get Decider → Check Approver → Approval Seal: Sign**. The
+workflow that sends runs **Approval Seal: Verify** first and stops if the content changed.
 
 ## Nodes
 
@@ -32,46 +142,38 @@ n8n nodes for **generic agent runners**. One workflow runs every agent. Each age
 
 ### Approval Seal (`approvalSeal`)
 
-`Sign` seals exactly the approved content together with the approver. Use it after **Check Approver**. `Verify` recomputes the seal right before anything is sent and stops the workflow if the content changed.
+`Sign` seals exactly the approved content together with the approver. Use it after **Check
+Approver**. `Verify` recomputes the seal right before anything is sent and stops the
+workflow if the content changed.
 
-- **v3** (new): `HMAC-SHA256(key, canonicalJson(['v3', type, fields, approver]))`. The key must have at least 32 characters.
-- **v2** (legacy): the hash the older code nodes wrote. It is only verified, never signed. Set **Legacy Key**, and remove it once no v2 seal is open.
+- **v3** (current): `HMAC-SHA256(key, canonicalJson(['v3', type, fields, approver]))`. The key
+  must have at least 32 characters.
+- **v2** (legacy): the hash that older code nodes wrote. It is only verified, never signed.
+  Set **Legacy Key**, and remove it once no v2 seal is open.
 
 ### roleALPHA Trigger (`roleAlphaTrigger`)
 
-Receives `context.changed` webhooks. It checks `X-RA-Signature: sha256=<hmac>` against the raw body and answers `401` if the signature is wrong. Register the production URL in roleALPHA under agent → *Context & Access*.
+Receives `context.changed` webhooks. It checks `X-RA-Signature: sha256=<hmac>` against the raw
+body and answers `401` if the signature is wrong. Register the production URL in roleALPHA
+under the agent → *Context & Access*.
 
 ## Credentials
 
 | Credential | Content |
 |---|---|
-| **roleALPHA Agent Keys API** | Optional, for the `Agent Keys` source. `baseUrl` of the data node, and `keys`: `{"<agent uuid>": "agt_…"}`, or a list of `{agentUuid, key, label}`. |
+| **MCP OAuth2** (n8n built-in) | Access to the roleALPHA MCP endpoint for one organisation. Used for agents (default source) and for every traversal. The `agent` view needs admin rights on the tenant. |
+| **roleALPHA Agent Keys API** | Optional, for the `Agent Keys` source. `baseUrl` of the data node, and `keys`: `{"<agent uuid>": "agt_…"}`, or a list of `{agentUuid, key, label}`. An agent key reads only its own agent, so it cannot traverse. |
 | **roleALPHA Webhook API** | One signing secret, a JSON list of secrets, or a map from agent UUID to secret. |
 | **Approval Seal API** | `key` (sign and verify) and optionally `legacyKey` (verify v2 only). |
-| **MCP OAuth2** (n8n built-in) | Access to the roleALPHA MCP endpoint for one organisation. Used for agents (default source) and traversal. **A new agent runs as soon as it is `active` in roleALPHA**: the scheduler finds it on its next tick. The `agent` view needs admin rights on the tenant. An agent key can read only its own agent, so it cannot traverse. |
 
-Agent keys and webhook secrets are issued in the roleALPHA UI and shown only once. Store them nowhere except in these credentials.
+Agent keys and webhook secrets are issued in the roleALPHA interface and shown only once.
+Store them nowhere except in these credentials.
 
-## Generic runner (outline)
+## Settings
 
-```
-Scheduler (cron)                        Event router (one webhook)
- └ roleALPHA: List Agents                └ map (collection, status) → step custom ID
-   └ roleALPHA: Get Duties                 └ roleALPHA: Get Step → responsible role → active agent
-     └ roleALPHA: Is Due (last runs)         ┘
-       └──────────────► Runner(agentUuid, step, trigger, event)
-                          ├ roleALPHA: Get Context          (active + guardrails, fail-closed)
-                          ├ roleALPHA: Check Responsibility (fail-closed)
-                          ├ roleALPHA: Get Step
-                          ├ roleALPHA: Build System Prompt
-                          └ AI Agent (+ data tool limited to the role's domains)
-```
-
-### Dependencies within a step
-
-A step can hold many tasks shared by several roles, and their parts can depend on each other (a visual needs the text, the hand-over needs all parts). The runner asks **Share** for the agent's part and what it needs. The agent checks the data before a dependent task; if the result is missing it does what it can, records a wait (`wait_for` tool: a row with `state = waiting`, `waits_for` = role UUIDs) and ends. After every run, **Wait → Plan After Run** adds a `done` row, wakes the agents of the same step that wait on one of the finished run's roles (same records), and the runner is called again for them with `event.wake = {attempt, wokenBy}`. Rows live in any store of the workflow, e.g. an n8n data table with the columns `state, step_uuid, step_custom_id, agent_uuid, agent_name, roles, waits_for, reason, record_keys, event, run_id, attempts, progress, at`.
-
-### Robustness and limits
+The runner reads its limits from a table with the columns `scope, target, key, value`. A row
+with `scope = global` applies to every run. `step` (target: step UUID or custom ID) and
+`agent` (target: agent UUID) narrow it down. The order is default < global < step < agent.
 
 | Setting | Default | Bounds | Meaning |
 |---|---|---|---|
@@ -83,30 +185,112 @@ A step can hold many tasks shared by several roles, and their parts can depend o
 | `escalate` | true | – | Report stuck waits to the role that leads the circle |
 | `shareCacheHours` | 24 | 0–720 | Reuse a share decision while step, roles and trigger kind stay the same (0 = never) |
 
-Every wake-up names one row (`claimId`). The runner deletes that row first and wakes only if the delete removed it, so two runs that plan at the same time never wake an agent twice. Texts that one agent leaves for another (`reason`, `event`) are cut to fixed sizes and passed as data. A duty marked `handover` (it closes the step) always waits on every other filled role of the step.
+A row with a value outside the bounds is clamped and reported. A wrong row can make the
+runner more careful, never unbounded.
 
-Gates (approvals) follow this order: **Get Decider → Check Approver → Approval Seal: Sign**. The channel that sends runs **Approval Seal: Verify** first.
+Wait rows live in any store of the workflow, for example an n8n data table with the columns
+`state, step_uuid, step_custom_id, agent_uuid, agent_name, roles, waits_for, reason,
+record_keys, event, run_id, attempts, progress, at`.
 
-## Security notes
+## Security
 
 - Every check is fail-closed. If roleALPHA cannot be read, the result is "not allowed".
 - Agents never approve. Check Approver ignores agents that fill the deciding role.
+- Rights go into the tools from the check, never from the model. The data tool sees only the
+  collections in the domains of the agent's roles.
 - The prompt marks trigger payloads as data. Guardrails take precedence over event content.
 - Keep `requireActive` and `requireGuardrails` on in production.
-- Settings from a table are clamped to fixed bounds: a wrong row can make the runner more careful, never unbounded.
-- Duplicate runs are blocked by leases; wake-ups are claimed before they fire.
-- No credentials are kept in wait, settings or cache rows.
+- Settings are clamped to fixed bounds.
+- Duplicate runs are blocked by leases, and wake-ups are claimed before they fire.
+- No credentials are kept in wait, settings or cache rows. The share cache key holds no
+  record content, and a cached answer is checked again like a fresh one.
 
-## Build and install (self-hosted)
+Found a security problem? Please do not describe it in a public issue. Open an issue that only
+asks for a contact, and roleALPHA GmbH will get back to you.
+
+## Installation (self-hosted n8n)
+
+### Requirements
+
+- A self-hosted n8n with access to its custom extensions folder
+- A roleALPHA organisation and an MCP OAuth2 credential for it
+- Node.js and npm to build the package
+
+### Build and install
+
+```bash
+git clone https://github.com/roleALPHA/n8n-nodes-rolealpha.git
+cd n8n-nodes-rolealpha
+npm install
+npm run build
+npm test
+npm pack                     # → n8n-nodes-rolealpha-<version>.tgz
+
+# on the n8n host (custom extensions folder, e.g. ~/.n8n/custom):
+npm install /path/to/n8n-nodes-rolealpha-<version>.tgz
+# restart n8n
+```
+
+### Updating
+
+Build and pack the new version, install the tarball over the old one in the same folder,
+and restart n8n. Workflows keep their nodes. New parameters start with their defaults.
+
+## Things that trip people up
+
+**1. The `agent` view needs admin rights.** **Get Context** reads, by default, exactly what the
+agent would receive over its own key. That view needs admin rights on the tenant. Without
+them, switch to the `caller` view, and know that it shows what the connection may see, not
+what the agent sees.
+
+**2. An agent key cannot traverse.** It reads its own agent and nothing else. Every
+Responsibility operation needs the MCP OAuth2 credential.
+
+**3. Keep `runTimeoutMinutes` at or above the workflow timeout.** If a lease counts as dead
+before the run really ends, a queued start can run while the first one is still busy.
+
+**4. The circle lead must be recognisable.** **Get Circle Lead** looks for a lead flag, "Lead
+Link" in the purpose, a custom ID ending in `:lead`, or the role that decides on or is
+accountable for the circle. If none fits, `lead` is null, and the escalation names the
+circle instead of a role.
+
+**5. Write status values exactly.** Steps are mapped to records by step custom ID and status
+value. Those are the technical values that may stay fixed, so a typo in one of them is
+not caught by the graph.
+
+## Troubleshooting
+
+| Symptom | Cause |
+|---|---|
+| `Agent … is not active in roleALPHA` | The agent's status in roleALPHA is not `active`. Expected: it does not run. |
+| `Agent … is bound by no policy` | No policy binds the agent. Bind one, or switch off `requireGuardrails` for tests only. |
+| `None of the roles is responsible for this step` | None of the agent's roles is `RESPONSIBLE_FOR` the step. Check the role, not the agent. |
+| A start returns `queueRow` instead of running | Another run of the same agent, step and records holds the lease. The queued start runs when that run ends. |
+| `No lease of this run was found; refusing to start` | The runner did not add its lease row before **Check Start**, or the store did not return it. |
+| The agent stops with a max-iterations error | The agent needed more tool calls than `maxIterations`. Raise it for that step with a `step` row in the settings table. |
+| A wait is never woken | Nobody of the awaited role ran on the same records. The scheduler wakes it after `maxWaitMinutes`, and escalates at `maxAttempts`. |
+| `settingProblems` is not empty | A row in the settings table has an unknown key or scope, or a value outside the bounds. The message names the row. |
+| Webhook answers `401` | The `X-RA-Signature` does not match. Check the secret in **roleALPHA Webhook API**. |
+
+## Licence
+
+**MIT.** The terms are in [LICENSE](LICENSE). Use it, change it, build on it, commercially
+too. roleALPHA itself is a separate product and not covered by this licence.
+
+## Contributing
 
 ```bash
 npm install
 npm run build
 npm test
-npm pack                     # → n8n-nodes-rolealpha-0.3.0.tgz
-# on the n8n host (custom extensions folder, e.g. ~/.n8n/custom):
-npm install /path/to/n8n-nodes-rolealpha-0.3.0.tgz
-# restart n8n
 ```
 
-The package is marked `private`. It is not published to the npm registry.
+| Command | Purpose |
+|---|---|
+| `npm run build` | Compile TypeScript to `dist` and copy the node icons |
+| `npm test` | Compile the tests and run them with Node's test runner (`test/*.test.ts`) |
+| `npm run lint` | `tsc --noEmit` |
+
+The logic lives in `lib/` and is tested without n8n. The node files in `nodes/` only map
+parameters to it. Keep it that way: a rule that decides who may act belongs in `lib/` with
+a test.
