@@ -83,7 +83,13 @@ export function buildTask(input: { step: Pick<Step, 'name'>; share: ShareResult;
 		lines.push(`${n + 1}. ${d.task}${d.handover ? ' [closes the step, do it last]' : ''}${d.needs.length ? ` (needs first: ${d.needs.map((x) => `${x.role}: ${x.what}`).join('; ')})` : ''}`),
 	);
 	if (share.notMine.length) lines.push('', 'Not your part (other roles do it, do not do it):', ...share.notMine.map((t) => `- ${t}`));
-	lines.push('', `If a result you need from another role is missing, do what you can without it, then call "${WAIT_TOOL}". Follow the rules and guardrails, then report.`);
+	// A part that names no delivery of another role has nothing to wait for; finishing it is the whole run.
+	lines.push(
+		'',
+		share.duties.some((d) => d.needs.length)
+			? `If a result you need from another role is missing, do what you can without it, then call "${WAIT_TOOL}". Follow the rules and guardrails, then report.`
+			: `Your part needs no result of another role. Do not call "${WAIT_TOOL}", also not for the handover of another role; do your part, follow the rules and guardrails, then report.`,
+	);
 	return lines.join('\n');
 }
 

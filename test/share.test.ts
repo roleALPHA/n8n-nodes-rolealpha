@@ -120,7 +120,10 @@ test('the prompt shows the own part, what is not the agent\'s and how to wait', 
 	const task = buildTask({ step, share, triggerType: 'event' });
 	assert.match(task, /^Work now on your part of the step "Content" \(trigger: event\)/);
 	assert.match(task, /2\. Set post 7 to review \(needs first: Visual Design: visual of post 7; Video: video of post 7\)/);
+	assert.match(task, /then call "wait_for"/);
 	assert.doesNotMatch(buildSystemPrompt({ bundle: textBundle, step }), /wait_for/);
+	const free = checkShare(input, { duties: [{ id: 'A1.1', task: 'Write the LinkedIn text for post 7', needs: [] }], notMine: [], reason: '' });
+	assert.match(buildTask({ step, share: free }), /Your part needs no result of another role\. Do not call "wait_for"/);
 });
 
 test('record keys compare as sets; no keys match only no keys', () => {
