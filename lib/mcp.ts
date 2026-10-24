@@ -98,6 +98,26 @@ export function unwrapToolResult(result: unknown): unknown {
 	return values.length === 1 ? values[0] : values;
 }
 
+/** Waits before a repeated call; injected so tests run without delay. */
+export type Sleep = (ms: number) => Promise<void>;
+
+const sleepFor: Sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Repeats of a call the server turned away for load (429, 503) or answered empty. */
+const RETRIES = 4;
+const MAX_WAIT_MS = 30_000;
+
+/** Wait before repeat `attempt` (0-based): Retry-After if the server sent one, else 1, 2, 4, 8 s plus jitter. */
+export function retryDelay(reply: HttpReply | undefined, attempt: number, random: () => number = Math.random): number {
+	const after = reply ? header(reply.headers, 'retry-after') : undefined;
+	const seconds = after !== undefined && /^\d+(\.\d+)?$/.test(after.trim()) ? Number(after) : NaN;
+	const base = Number.isFinite(seconds) ? seconds * 1000 : 1000 * 2 ** attempt;
+	return Math.min(MAX_WAIT_MS, Math.round(base + random() * 500));
+}
+
+/** A tool whose name says it only reads may be called again after an empty reply. */
+const READ_TOOL = /^(get|search|find|list|check|query|describe)_/;
+
 export class McpClient {
 	private sessionId?: string;
 	private nextId = 1;
@@ -107,7 +127,22 @@ export class McpClient {
 	constructor(
 		private readonly transport: Transport,
 		private readonly clientName = 'n8n-nodes-rolealpha',
+		private readonly sleep: Sleep = sleepFor,
 	) {}
+
+	/** Sends one request; repeats it while the server turns it away for load. */
+	private async send(method: string, params: unknown, payload: Record<string, unknown>, headers: Record<string, string>, notification: boolean): Promise<HttpReply> {
+		const tool = method === 'tools/call' ? String((params as { name?: unknown })?.name ?? '') : '';
+		const mayRepeatEmpty = !notification && (method !== 'tools/call' || READ_TOOL.test(tool));
+		for (let attempt = 0; ; attempt++) {
+			const reply = await this.transport(payload, headers);
+			// An exhausted agent budget is final; anything else under 429 or 503 is load and passes.
+			const busy = (reply.status === 429 || reply.status === 503) && !/agent_budget_erschoepft/.test(reply.body ?? '');
+			const empty = mayRepeatEmpty && reply.status < 400 && (reply.body ?? '').trim() === '';
+			if ((!busy && !empty) || attempt >= RETRIES) return reply;
+			await this.sleep(retryDelay(reply, attempt));
+		}
+	}
 
 	private async rpc(method: string, params: unknown, notification = false): Promise<unknown> {
 		const id = notification ? undefined : this.nextId++;
@@ -118,7 +153,7 @@ export class McpClient {
 		if (this.sessionId) headers['Mcp-Session-Id'] = this.sessionId;
 		const payload: Record<string, unknown> = { jsonrpc: '2.0', method, params };
 		if (id !== undefined) payload.id = id;
-		const reply = await this.transport(payload, headers);
+		const reply = await this.send(method, params, payload, headers, notification);
 		// The server forgot the session (e.g. after a release): open a new one once and repeat the call.
 		if (reply.status === 404 && this.sessionId && method !== 'initialize' && !notification && !this.renewing) {
 			this.sessionId = undefined;

@@ -288,6 +288,9 @@ not caught by the graph.
 | `roleALPHA refused the run: agent_nicht_gebunden` | The function account may not run this agent. Add the agent under "May run these agents" of the account. |
 | `roleALPHA refused the run: kein_agent_run_recht` | No role of the function account has `agent:run`. |
 | `Acting as an agent needs a function account` | The MCP OAuth2 credential uses another grant type. Use the client ID and secret of a function account. |
+| `MCP initialize failed with HTTP 429` | Many runs started at once and roleALPHA turned some away. The client repeats a call turned away with 429 or 503 up to four times (Retry-After, else 1, 2, 4, 8 s). If it still fails, start fewer runs at once. |
+| `Empty MCP response` | The server answered with no body. Reading calls are repeated; a writing tool is not, so it cannot run twice. |
+| `Cannot access "arguments" due to security concerns` | n8n blocks the name `arguments` in expressions and in `$fromAI`. Name the tool input `toolArgs` or `args`. |
 | Webhook answers `401` | The `X-RA-Signature` does not match. Check the secret in **roleALPHA Webhook API**. |
 
 ## Licence

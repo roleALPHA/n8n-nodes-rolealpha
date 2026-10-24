@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { agentStatus } from '../lib/agents';
-import { McpClient, parseRpcBody, unwrapToolResult, type HttpReply } from '../lib/mcp';
+import { McpClient, parseRpcBody, retryDelay, unwrapToolResult, type HttpReply } from '../lib/mcp';
 import { canonicalJson, legacySeal, signSeal, verifySeal } from '../lib/seal';
 import { parseEvent, parseSecrets, signBody, verifySignature } from '../lib/webhook';
 import { keyFor, parseKeyring } from '../lib/keys';
@@ -60,6 +60,34 @@ test('McpClient opens a new session once when the server forgot it, and lists to
 	const client = new McpClient(transport);
 	assert.deepEqual((await client.listTools()).map((t) => t.name), ['a', 'b'], 'second page fails on s1, a new session repeats it');
 	assert.ok(seen.includes('tools/list@s2'));
+});
+
+test('McpClient repeats calls turned away for load, and empty replies of reads only', async () => {
+	const waits: number[] = [];
+	const seen: string[] = [];
+	let busy = 2;
+	let empty = 1;
+	const transport = async (body: unknown): Promise<HttpReply> => {
+		const b = body as { id?: number; method: string; params?: { name?: string } };
+		seen.push(b.params?.name ?? b.method);
+		if (b.method === 'initialize' && busy-- > 0) return { status: 429, headers: busy === 1 ? { 'Retry-After': '3' } : {}, body: 'Too Many Requests' };
+		if (b.method === 'initialize') return { status: 200, headers: { 'mcp-session-id': 's1' }, body: JSON.stringify({ jsonrpc: '2.0', id: b.id, result: {} }) };
+		if (b.method === 'notifications/initialized') return { status: 202, headers: {}, body: '' };
+		if (b.params?.name === 'get_x' && empty-- > 0) return { status: 200, headers: {}, body: '' };
+		if (b.params?.name === 'create_x') return { status: 200, headers: {}, body: '' };
+		return { status: 200, headers: {}, body: JSON.stringify({ jsonrpc: '2.0', id: b.id, result: { content: [{ type: 'text', text: '{"ok":true}' }] } }) };
+	};
+	const client = new McpClient(transport, 'test', async (ms) => void waits.push(ms));
+	assert.deepEqual(await client.callTool('get_x', {}), { ok: true });
+	assert.deepEqual(seen, ['initialize', 'initialize', 'initialize', 'notifications/initialized', 'get_x', 'get_x']);
+	assert.ok(waits[0] >= 3000 && waits[0] < 3500, 'Retry-After is honoured');
+	await assert.rejects(client.callTool('create_x', {}), /Empty/, 'a write is not repeated after an empty reply');
+	assert.equal(seen.filter((s) => s === 'create_x').length, 1);
+
+	const budget = new McpClient(async () => ({ status: 429, headers: {}, body: '{"error":"agent_budget_erschoepft"}' }), 'test', async () => assert.fail('no wait'));
+	await assert.rejects(budget.callTool('get_x', {}), /HTTP 429/);
+	assert.equal(retryDelay(undefined, 3, () => 0), 8000);
+	assert.equal(retryDelay({ status: 429, headers: { 'retry-after': '120' }, body: '' }, 0, () => 0), 30000);
 });
 
 test('McpClient surfaces HTTP errors', async () => {
