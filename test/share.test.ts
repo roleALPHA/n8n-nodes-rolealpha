@@ -74,6 +74,18 @@ test('buildShareInput lists only own accountabilities and the other roles of the
 	assert.throws(() => buildShareInput(visualBundle, step, [TEXT]), /None of the roles/);
 });
 
+test('buildShareInput shows the model no record data, so a cached part fits every record', async () => {
+	const step = await getStep(contentGraph(), STEP, { resolveHolders: true, roleDetails: true });
+	const a = buildShareInput(visualBundle, step, [VISUAL], { type: 'event', event: { collection: 'posts', status: 'draft', keys: ['14'] } });
+	const b = buildShareInput(visualBundle, step, [VISUAL], { type: 'event', event: { collection: 'posts', status: 'draft', keys: ['15'] } });
+	const c = buildShareInput(visualBundle, step, [VISUAL], { type: 'event', event: { collection: 'posts', status: 'review', keys: ['15'] } });
+	assert.equal(a.cacheKey, b.cacheKey);
+	assert.equal(a.prompt, b.prompt);
+	assert.notEqual(a.cacheKey, c.cacheKey);
+	assert.doesNotMatch(a.prompt, /14/);
+	assert.match(a.prompt, /Kind of event: \{"collection":"posts","status":"draft"\}/);
+});
+
 test('checkShare drops invented duties and roles and collects what to wait for', async () => {
 	const step = await getStep(contentGraph(), STEP, { resolveHolders: true, roleDetails: true });
 	const input = buildShareInput(visualBundle, step, [VISUAL]);
