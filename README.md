@@ -73,8 +73,10 @@ list of what is not its part, and the rules for waiting.
 
 **Waiting is part of the job.** If the text is not there yet, the visual cannot be drawn.
 The agent does what it can, records a wait and stops. When the role it waited for finishes
-a run, **Wait → Plan After Run** wakes it again. A duty that closes the step always waits
-for every other filled role of the step.
+a run, **Wait → Plan After Run** wakes it again. A duty that closes the step waits only on
+the deliveries it needs: a result that is named, stored in data and needed for the task.
+Informing people or asking them for feedback is no delivery, so a role that only
+communicates never holds a hand-over up.
 
 **No double runs, no double wake-ups.** Every run takes a lease first. A second start for
 the same agent, step and records is queued, not run. Every wake-up claims its row before it
@@ -97,6 +99,7 @@ Scheduler (cron)                        Event router (one webhook)
    └ roleALPHA: Get Duties                 └ roleALPHA: Get Step → responsible role → active agent
      └ roleALPHA: Is Due (last runs)         ┘
        └──────────────► Runner(agentUuid, step, trigger, event)
+                          ├ roleALPHA: Start Run            (run token of the agent, agent:run)
                           ├ roleALPHA: Get Context          (active + guardrails, fail-closed)
                           ├ roleALPHA: Check Responsibility (fail-closed)
                           ├ roleALPHA: Get Step
@@ -104,12 +107,20 @@ Scheduler (cron)                        Event router (one webhook)
                           ├ Wait: Check Start               (lease, duplicate-run guard)
                           ├ Share: Build Input → model → Share: Check (cached)
                           ├ roleALPHA: Build System Prompt
-                          ├ AI Agent (+ data tool limited to the domains of the agent's roles)
+                          ├ AI Agent (+ data tool limited to the domains of the agent's roles,
+                          │           + roleALPHA: Tool, read only, as the agent)
                           └ Wait: Plan After Run            (done row, wake-ups, lease released)
 
 Scheduler, every tick
  └ Wait: Find Stale Waits → wake (claimed) · remove dead leases · escalate → Get Circle Lead
 ```
+
+**Every read is the agent's own.** With **Connect As: Agent** the node swaps the function
+account token for a run token of the agent (roleALPHA `agent:run`, RFC 8693, 15 minutes).
+Context, step, roles and the read tool of the model then see exactly what the agent may
+see, without admin rights and without a key per agent in n8n. **Start Run** swaps first and
+returns a refusal as data (`code`, `reaction`): an agent that is paused, over budget or not
+bound to the account does not run. There is no fallback to the view of the account.
 
 Approval gates follow this order: **Get Decider → Check Approver → Approval Seal: Sign**. The
 workflow that sends runs **Approval Seal: Verify** first and stops if the content changed.
@@ -122,6 +133,7 @@ workflow that sends runs **Approval Seal: Verify** first and stops if the conten
 |---|---|---|---|
 | Agent | Get Context | Reads an agent's context bundle (identity, roles, guardrails). Fails if the agent is not `active` or has no policy, unless you switch that off. Over MCP it reads the `agent` view by default, exactly what the agent gets over its own key. | MCP OAuth2 (default) or roleALPHA Agent Keys API |
 | Agent | Get Context Version | Change check. Cheap and not audited with agent keys; over MCP it reads the bundle. | MCP OAuth2 or roleALPHA Agent Keys API |
+| Agent | Start Run | Swaps the function account token for a run token of the agent (`agent:run`). Returns `started`, or `code` and `reaction` of the refusal (`pause`, `pauseUntilNextPeriod`, `informAdmin`, `retryLater`, …). The token never appears in the output. | MCP OAuth2 with client credentials |
 | Agent | List Agents | Over MCP: every agent of the organisation, paged. With agent keys: one item per key. By default it skips agents that are not active. | MCP OAuth2 or roleALPHA Agent Keys API |
 | Responsibility | Get Duties | Lists the steps the agent's roles are `RESPONSIBLE_FOR`, with the circle. | MCP OAuth2 |
 | Responsibility | Find Step by Custom ID | Looks up a step by an exact custom ID. | MCP OAuth2 |
@@ -131,6 +143,7 @@ workflow that sends runs **Approval Seal: Verify** first and stops if the conten
 | Responsibility | Check Responsibility | Is one of the agent's roles responsible for this step? | MCP OAuth2 |
 | Responsibility | Get Circle Lead | One item per circle of the agent's roles: the role that leads the circle and its holders, e.g. to escalate to. Recognised from a lead flag on the role, else "Lead Link" in its purpose, else a custom ID ending in `:lead`, else the role that decides on or is accountable for the circle. `lead` is null when none is found. | MCP OAuth2 |
 | Responsibility | Get Role Holders | Returns the persons (with address) and agents filling a role. | MCP OAuth2 |
+| Tool | Call Tool / List Tools | Calls one roleALPHA MCP tool from an allow list, e.g. as the read tool of an AI agent. Tool name `list` returns the allowed tools with their arguments; the organisation is added. Errors come back as data, a refused run ends it. | MCP OAuth2 |
 | Prompt | Build System Prompt | Builds the system prompt from the bundle, the step, the duties and the trigger. Event data is passed as data, never as instructions. With a **Share** it adds the agent's part, what is not its part, the rules for waiting within the step, and returns `task` as the user message. | – |
 | Share | Build Input | Prepares the model call that decides the agent's part of a step: only the accountabilities of its own roles count, the other responsible roles of the step are listed with theirs. Returns `systemMessage`, `prompt` and `schema` for a structured output parser. Needs Get Step with Role Details. | – |
 | Share | Check | Checks the model answer against roleALPHA: drops duties that are no accountability of the agent and needs on roles that are not on the step. Returns `duties` (with `needs`), `notMine`, `waitsFor` and `waitRoleUuids`. | – |
@@ -161,7 +174,7 @@ under the agent → *Context & Access*.
 
 | Credential | Content |
 |---|---|
-| **MCP OAuth2** (n8n built-in) | Access to the roleALPHA MCP endpoint for one organisation. Used for agents (default source) and for every traversal. The `agent` view needs admin rights on the tenant. |
+| **MCP OAuth2** (n8n built-in) | Access to the roleALPHA MCP endpoint for one organisation. Used for agents (default source) and for every traversal. The `agent` view needs admin rights on the tenant. For **Connect As: Agent** it must be a roleALPHA function account (grant type Client Credentials) whose role has `agent:run` and that may run the agent ("May run these agents"). |
 | **roleALPHA Agent Keys API** | Optional, for the `Agent Keys` source. `baseUrl` of the data node, and `keys`: `{"<agent uuid>": "agt_…"}`, or a list of `{agentUuid, key, label}`. An agent key reads only its own agent, so it cannot traverse. |
 | **roleALPHA Webhook API** | One signing secret, a JSON list of secrets, or a map from agent UUID to secret. |
 | **Approval Seal API** | `key` (sign and verify) and optionally `legacyKey` (verify v2 only). |
@@ -196,6 +209,8 @@ record_keys, event, run_id, attempts, progress, at`.
 
 - Every check is fail-closed. If roleALPHA cannot be read, the result is "not allowed".
 - Agents never approve. Check Approver ignores agents that fill the deciding role.
+- Runs act as their agent: the run token carries the agent's view, writes only drafts, and is
+  never written to node output. A refused swap stops the run; there is no fallback.
 - Rights go into the tools from the check, never from the model. The data tool sees only the
   collections in the domains of the agent's roles.
 - The prompt marks trigger payloads as data. Guardrails take precedence over event content.
@@ -270,6 +285,9 @@ not caught by the graph.
 | The agent stops with a max-iterations error | The agent needed more tool calls than `maxIterations`. Raise it for that step with a `step` row in the settings table. |
 | A wait is never woken | Nobody of the awaited role ran on the same records. The scheduler wakes it after `maxWaitMinutes`, and escalates at `maxAttempts`. |
 | `settingProblems` is not empty | A row in the settings table has an unknown key or scope, or a value outside the bounds. The message names the row. |
+| `roleALPHA refused the run: agent_nicht_gebunden` | The function account may not run this agent. Add the agent under "May run these agents" of the account. |
+| `roleALPHA refused the run: kein_agent_run_recht` | No role of the function account has `agent:run`. |
+| `Acting as an agent needs a function account` | The MCP OAuth2 credential uses another grant type. Use the client ID and secret of a function account. |
 | Webhook answers `401` | The `X-RA-Signature` does not match. Check the secret in **roleALPHA Webhook API**. |
 
 ## Licence

@@ -65,8 +65,8 @@ export function shareRules(share: ShareResult): string[] {
 function shareBlock(share: ShareResult): string[] {
 	const out = ['', '# Your part of this step'];
 	share.duties.forEach((d, n) => {
-		out.push(`${n + 1}. ${d.task} (accountability of ${d.role}: ${d.accountability})${d.handover ? ' – closes the step: do it last, only when every other part of the step is there' : ''}`);
-		for (const need of d.needs) out.push(`   Needs first from ${need.role}: ${need.what}`);
+		out.push(`${n + 1}. ${d.task} (accountability of ${d.role}: ${d.accountability})${d.handover ? ' – closes the step: do it last, only when the deliveries it needs are there' : ''}`);
+		for (const need of d.needs) out.push(`   Needs first from ${need.role}: ${need.what}${need.where ? ` (in ${need.where})` : ''}`);
 	});
 	if (share.notMine.length) {
 		out.push('', '## Not your part (other roles do it)');

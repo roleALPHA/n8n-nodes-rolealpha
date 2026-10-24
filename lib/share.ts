@@ -30,7 +30,7 @@ export interface ShareOtherRole {
 	name: string;
 	/** Whether an active agent fills the role; only then does its finished run wake the waiting agents. */
 	hasActiveAgent: boolean;
-	/** Whether anybody (active agent or person) fills the role; a hand-over waits only on filled roles. */
+	/** Whether anybody (active agent or person) fills the role. */
 	filled: boolean;
 }
 
@@ -54,6 +54,8 @@ export interface ShareNeed {
 	roleUuid: string;
 	role: string;
 	what: string;
+	/** Where the result is found (collection, field, status), so a check can see it is there. */
+	where: string;
 }
 
 export interface ShareDuty {
@@ -62,7 +64,7 @@ export interface ShareDuty {
 	role: string;
 	accountability: string;
 	task: string;
-	/** The duty closes the step (hand-over, status change for the next step): it waits on every other filled role. */
+	/** The duty closes the step (hand-over, status change for the next step): it is done last, after its needs. */
 	handover: boolean;
 	needs: ShareNeed[];
 }
@@ -93,15 +95,15 @@ export const SHARE_SYSTEM_MESSAGE = [
 	'A process step can hold many tasks, and several roles share it. Decide which part of this step belongs to the roles of one agent, and what that part needs from the other roles of the same step.',
 	'1. Only an accountability listed under "Accountabilities of the agent\'s roles" can make a task the agent\'s part. The role purpose is context only and adds no task.',
 	'2. Pick each accountability that this step calls for in this run (step description, criteria, result and trigger). For each, write in "task" concretely what the agent does now in this step under exactly that accountability, and nothing beyond it.',
-	'3. In "needs", list for each duty the results of other roles of this step that must exist before the agent can do that task: the role id (R…) and in "what" exactly which result. List a need only when the task cannot be done without it, for example a visual needs the text it illustrates, or a hand-over needs all parts of the step to be finished. Leave "needs" empty when the task can start right away.',
+	'3. In "needs", list for each duty the deliveries of other roles of this step that must exist before the agent can do that task: the role id (R…), in "what" exactly which result, and in "where" where it is found (collection, field or status). A delivery is a result that the step description or an accountability of that role names, that is stored in data where it can be checked, and without which the task cannot be done, for example the text a visual illustrates, or a decision the step requires before the hand-over. Informing people, asking for feedback, recording or answering questions is no delivery and never a need. Leave "needs" empty when the task can start right away.',
 	'4. List in "notMine" every task of the step that none of the listed accountabilities covers.',
 	'5. Never stretch an accountability to cover a task it does not name. If none fits, return an empty "duties" list.',
 	'6. Use only the ids from the input. Write "task", "what", "notMine" and "reason" in the language of the step.',
-	'7. Set "handover" to true for a duty that closes the step for the next one, e.g. handing results on or setting the status for the next step. Such a duty always comes after every other part of the step.',
+	'7. Set "handover" to true for a duty that closes the step for the next one, e.g. handing results on or setting the status for the next step. Such a duty is done last. It waits only on the deliveries listed in its "needs", never on a role that delivers nothing in this step.',
 ].join('\n');
 
 /** Raise when the rules or the input format change, so cached decisions are not reused. */
-export const SHARE_VERSION = 'share-3';
+export const SHARE_VERSION = 'share-4';
 
 /** Event fields that change the share decision; record data (ids, texts) does not. */
 const EVENT_KIND_FIELDS = ['collection', 'status', 'event', 'action', 'type'];
@@ -124,9 +126,10 @@ export const SHARE_SCHEMA = {
 							type: 'object',
 							properties: {
 								role: { type: 'string', description: 'Id of another role of this step, e.g. R1' },
-								what: { type: 'string', description: 'The result of that role this task needs first' },
+								what: { type: 'string', description: 'The delivery of that role this task needs first' },
+								where: { type: 'string', description: 'Where the delivery is found: collection, field or status' },
 							},
-							required: ['role', 'what'],
+							required: ['role', 'what', 'where'],
 						},
 					},
 				},
@@ -252,15 +255,10 @@ export function checkShare(input: ShareInput, answer: unknown): ShareResult {
 			const n = (rawNeed && typeof rawNeed === 'object' ? rawNeed : {}) as Record<string, unknown>;
 			const role = roleById.get(text(n.role)) ?? roleByName.get(lower(n.role));
 			const what = text(n.what);
-			if (role && what && !needs.some((x) => x.roleUuid === role.uuid && x.what === what)) needs.push({ roleUuid: role.uuid, role: role.name, what: what.slice(0, 500) });
+			if (role && what && !needs.some((x) => x.roleUuid === role.uuid && x.what === what)) needs.push({ roleUuid: role.uuid, role: role.name, what: what.slice(0, 500), where: text(n.where).slice(0, 300) });
 		}
+		// A hand-over waits only on the deliveries it lists: a role that delivers nothing here holds nothing up.
 		const handover = d.handover === true || text(d.handover).toLowerCase() === 'true';
-		// A hand-over closes the step, so it needs every other filled role, whatever the model listed.
-		if (handover) {
-			for (const role of input.others.filter((r) => r.filled !== false)) {
-				if (!needs.some((x) => x.roleUuid === role.uuid)) needs.push({ roleUuid: role.uuid, role: role.name, what: 'its part of this step' });
-			}
-		}
 		duties.push({ id, roleUuid: acc.roleUuid, role: acc.role, accountability: acc.text, task: (text(d.task) || acc.text).slice(0, 2000), handover, needs });
 	}
 

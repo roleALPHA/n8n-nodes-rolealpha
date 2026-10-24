@@ -29,6 +29,7 @@ import { isDue } from '../../lib/schedule';
 import { buildShareInput, checkShare, SHARE_SCHEMA, type ShareInput, type ShareResult } from '../../lib/share';
 import { checkStart, findStaleWaits, planAfterRun, type FinishedRun, type Limits, type WaitRow } from '../../lib/waits';
 import { DEFAULT_SETTINGS, SETTING_BOUNDS, resolveSettings, type SettingRow } from '../../lib/settings';
+import { AgentRunError, AgentRunTokens, mcpRefusalCode, type FormPost, type FunctionAccount } from '../../lib/agentRun';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -58,6 +59,7 @@ const properties: INodeProperties[] = [
 			{ name: 'Schedule', value: 'schedule', description: 'Decide whether a step is due' },
 			{ name: 'Settings', value: 'settings', description: 'Runner limits from defaults and a settings table (global, step, agent)' },
 			{ name: 'Share', value: 'share', description: 'The part of a step that belongs to the agent\'s roles, and what it needs from other roles' },
+			{ name: 'Tool', value: 'tool', description: 'List and call roleALPHA MCP tools, e.g. as the read tool of an AI agent' },
 			{ name: 'Wait', value: 'wait', description: 'Wait for and wake other agents within one step' },
 		],
 		default: 'agent',
@@ -74,6 +76,7 @@ const properties: INodeProperties[] = [
 			{ name: 'Get Context', value: 'getContext', action: 'Get the context of an agent', description: 'Identity, roles and guardrails of one agent' },
 			{ name: 'Get Context Version', value: 'getContextVersion', action: 'Get the context version of an agent', description: 'Change check; cheap and not audited with agent keys' },
 			{ name: 'List Agents', value: 'listAgents', action: 'List agents', description: 'One item per agent of the organisation (MCP) or per key in the credential' },
+			{ name: 'Start Run', value: 'startRun', action: 'Start a run as an agent', description: 'Swaps the function account token for a run token of the agent (agent:run). A refusal comes back as data with its code.' },
 		],
 		default: 'getContext',
 	},
@@ -160,12 +163,58 @@ const properties: INodeProperties[] = [
 		default: 'getDuties',
 	},
 	{
+		displayName: 'Connect As',
+		name: 'connectAs',
+		type: 'options',
+		noDataExpression: true,
+		displayOptions: { show: { resource: ['agent', 'responsibility', 'tool'] }, hide: { source: ['agentKey'], operation: ['startRun', 'listAgents'] } },
+		options: [
+			{ name: 'Function Account', value: 'account', description: 'The view of the connection itself' },
+			{ name: 'Agent (Run Token)', value: 'agent', description: 'Exactly the view of the agent of this run (needs agent:run and a function account with client credentials)' },
+		],
+		default: 'account',
+	},
+	{
+		displayName: 'Run Agent UUID',
+		name: 'runAgentUuid',
+		type: 'string',
+		default: '',
+		required: true,
+		description: 'The agent this run acts as',
+		displayOptions: { show: { resource: ['agent', 'responsibility', 'tool'], connectAs: ['agent'] }, hide: { source: ['agentKey'], operation: ['startRun', 'listAgents'] } },
+	},
+	{
+		displayName: 'Run Agent UUID',
+		name: 'runAgentUuid',
+		type: 'string',
+		default: '',
+		required: true,
+		description: 'The agent this run acts as',
+		displayOptions: show('agent', ['startRun']),
+	},
+	{
+		displayName: 'Run ID',
+		name: 'runId',
+		type: 'string',
+		default: '={{ $execution.id }}',
+		description: 'Names the run in every audit entry; 1-128 characters of A-Z a-z 0-9 . _ : -. Sub-workflows of the run pass the same ID.',
+		displayOptions: { show: { resource: ['agent', 'responsibility', 'tool'], connectAs: ['agent'] }, hide: { source: ['agentKey'], operation: ['startRun', 'listAgents'] } },
+	},
+	{
+		displayName: 'Run ID',
+		name: 'runId',
+		type: 'string',
+		default: '={{ $execution.id }}',
+		description: 'Names the run in every audit entry; 1-128 characters of A-Z a-z 0-9 . _ : -. Sub-workflows of the run pass the same ID.',
+		displayOptions: show('agent', ['startRun']),
+	},
+	{
 		displayName: 'MCP Endpoint URL',
 		name: 'endpointUrl',
 		type: 'string',
 		default: 'https://rolealpha.app/api/mcp',
 		required: true,
-		displayOptions: { show: { resource: ['agent', 'responsibility'] }, hide: { source: ['agentKey'] } },
+		displayOptions: { show: { resource: ['agent', 'responsibility', 'tool'] }, hide: { source: ['agentKey'] } },
 	},
 	{
 		displayName: 'Organisation',
@@ -174,7 +223,7 @@ const properties: INodeProperties[] = [
 		default: '',
 		required: true,
 		description: 'Organisation (tenant) name or ID as roleALPHA knows it',
-		displayOptions: { show: { resource: ['agent', 'responsibility'] }, hide: { source: ['agentKey'] } },
+		displayOptions: { show: { resource: ['agent', 'responsibility', 'tool'] }, hide: { source: ['agentKey'] } },
 	},
 	{
 		displayName: 'Agent UUID',
@@ -518,6 +567,45 @@ const properties: INodeProperties[] = [
 			{ displayName: 'Only Due Items', name: 'onlyDue', type: 'boolean', default: false, description: 'Whether to drop items that are not due' },
 		],
 	},
+
+	// ---------------------------------------------------------------- tool
+	{
+		displayName: 'Operation',
+		name: 'operation',
+		type: 'options',
+		noDataExpression: true,
+		displayOptions: { show: { resource: ['tool'] } },
+		options: [
+			{ name: 'Call Tool', value: 'callTool', action: 'Call an MCP tool', description: 'Calls one allowed tool; tool name "list" returns the allowed tools with their arguments. Errors come back as data, so a model can react.' },
+			{ name: 'List Tools', value: 'listTools', action: 'List the allowed MCP tools' },
+		],
+		default: 'callTool',
+	},
+	{
+		displayName: 'Allowed Tools',
+		name: 'allowedTools',
+		type: 'string',
+		default: 'get_entity_details,get_entity_relationships,search_entities,search_persons,find_responsible',
+		required: true,
+		description: 'Comma-separated tool names. Any other tool is refused, even if the token could call it.',
+		displayOptions: { show: { resource: ['tool'] } },
+	},
+	{
+		displayName: 'Tool Name',
+		name: 'toolName',
+		type: 'string',
+		default: '',
+		description: 'One of the allowed tools, or "list"',
+		displayOptions: show('tool', ['callTool']),
+	},
+	{
+		displayName: 'Tool Arguments',
+		name: 'toolArguments',
+		type: 'string',
+		default: '{}',
+		description: 'Arguments as JSON text. The organisation is added when missing.',
+		displayOptions: show('tool', ['callTool']),
+	},
 ];
 
 // -------------------------------------------------------------------- helpers
@@ -562,7 +650,67 @@ function summarizeBundle(bundle: ContextBundle): IDataObject {
 	};
 }
 
-function mcpClientFor(ctx: IExecuteFunctions, endpointUrl: string): McpClient {
+interface RunAuth {
+	tokens: AgentRunTokens;
+	account: FunctionAccount;
+	agentUuid: string;
+	runId: string;
+}
+
+const formPost = (ctx: IExecuteFunctions): FormPost => async (url, form, headers) => {
+	const res = (await ctx.helpers.httpRequest({
+		method: 'POST',
+		url,
+		headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json', ...headers },
+		body: new URLSearchParams(form).toString(),
+		json: false,
+		encoding: 'text',
+		returnFullResponse: true,
+		ignoreHttpStatusErrors: true,
+	})) as { statusCode?: number; body?: unknown };
+	return { status: res.statusCode ?? 0, body: typeof res.body === 'string' ? res.body : JSON.stringify(res.body ?? '') };
+};
+
+/** The function account behind the MCP credential; a run token needs client credentials. */
+async function functionAccount(ctx: IExecuteFunctions): Promise<FunctionAccount> {
+	const c = await ctx.getCredentials('mcpOAuth2Api');
+	if (c.grantType !== 'clientCredentials' || !c.accessTokenUrl || !c.clientId || !c.clientSecret) {
+		throw new NodeOperationError(ctx.getNode(), 'Acting as an agent needs a function account: an MCP OAuth2 credential with grant type Client Credentials');
+	}
+	return { tokenUrl: String(c.accessTokenUrl), clientId: String(c.clientId), clientSecret: String(c.clientSecret), authentication: c.authentication === 'body' ? 'body' : 'header' };
+}
+
+function refusedRun(ctx: IExecuteFunctions, e: AgentRunError, i?: number): NodeOperationError {
+	return new NodeOperationError(ctx.getNode(), `roleALPHA refused the run: ${e.code}`, { itemIndex: i, description: `${e.description} (reaction: ${e.reaction})` });
+}
+
+/** MCP under a run token: one swap per run, swapped again on 401; a refusal ends the run. */
+function agentTransport(ctx: IExecuteFunctions, endpointUrl: string, auth: RunAuth) {
+	return async (body: unknown, headers: Record<string, string>): Promise<HttpReply> => {
+		const send = async (token: string) =>
+			(await ctx.helpers.httpRequest({
+				method: 'POST',
+				url: endpointUrl,
+				headers: { ...headers, Authorization: `Bearer ${token}` },
+				body: JSON.stringify(body),
+				json: false,
+				encoding: 'text',
+				returnFullResponse: true,
+				ignoreHttpStatusErrors: true,
+			})) as { statusCode?: number; headers?: Record<string, string>; body?: unknown };
+		let res = await send((await auth.tokens.runToken(auth.account, auth.agentUuid, auth.runId)).token);
+		if (res.statusCode === 401) {
+			auth.tokens.forget(auth.account, auth.agentUuid, auth.runId);
+			res = await send((await auth.tokens.runToken(auth.account, auth.agentUuid, auth.runId, { fresh: true })).token);
+		}
+		const text = typeof res.body === 'string' ? res.body : res.body === undefined ? '' : JSON.stringify(res.body);
+		if (res.statusCode === 401 || res.statusCode === 403) throw new AgentRunError(mcpRefusalCode(text) || `http_${res.statusCode}`, res.statusCode, text.slice(0, 300));
+		return { status: res.statusCode ?? 200, headers: res.headers ?? {}, body: text };
+	};
+}
+
+function mcpClientFor(ctx: IExecuteFunctions, endpointUrl: string, auth?: RunAuth): McpClient {
+	if (auth) return new McpClient(agentTransport(ctx, endpointUrl, auth));
 	const transport = async (body: unknown, headers: Record<string, string>): Promise<HttpReply> => {
 		try {
 			const res = (await ctx.helpers.httpRequestWithAuthentication.call(ctx, 'mcpOAuth2Api', {
@@ -609,7 +757,7 @@ export class RoleAlpha implements INodeType {
 		outputs: [NodeConnectionTypes.Main],
 		credentials: [
 			{ name: 'roleAlphaAgentKeysApi', required: true, displayOptions: { show: { resource: ['agent'], source: ['agentKey'] } } },
-			{ name: 'mcpOAuth2Api', required: true, displayOptions: { show: { resource: ['agent', 'responsibility'] }, hide: { source: ['agentKey'] } } },
+			{ name: 'mcpOAuth2Api', required: true, displayOptions: { show: { resource: ['agent', 'responsibility', 'tool'] }, hide: { source: ['agentKey'] } } },
 		],
 		properties,
 	};
@@ -633,11 +781,38 @@ export class RoleAlpha implements INodeType {
 			}
 		}
 
+		// Acting as an agent: every MCP call of this node runs under the run token of that agent.
+		const startRun = resource === 'agent' && operation === 'startRun';
+		const usesMcp = ['agent', 'responsibility', 'tool'].includes(resource) && source !== 'agentKey';
+		const asAgent = startRun || (usesMcp && operation !== 'listAgents' && this.getNodeParameter('connectAs', 0, 'account') === 'agent');
+		let runAuth: RunAuth | undefined;
+		if (asAgent) {
+			runAuth = {
+				tokens: new AgentRunTokens(formPost(this)),
+				account: await functionAccount(this),
+				agentUuid: String(this.getNodeParameter('runAgentUuid', 0, '') ?? '').trim().toLowerCase(),
+				runId: String(this.getNodeParameter('runId', 0, '') ?? '').trim(),
+			};
+		}
+
+		if (startRun) {
+			const auth = runAuth!;
+			try {
+				const t = await auth.tokens.runToken(auth.account, auth.agentUuid, auth.runId);
+				// The token itself never leaves the node.
+				out.push({ json: { started: true, agentUuid: t.agent.uuid, agentName: t.agent.name, runId: t.runId, expiresAt: new Date(t.expiresAt).toISOString() } });
+			} catch (error) {
+				if (!(error instanceof AgentRunError)) throw error;
+				out.push({ json: { started: false, agentUuid: auth.agentUuid, runId: auth.runId, code: error.code, reaction: error.reaction, reason: error.description } });
+			}
+			return [out];
+		}
+
 		// One MCP session (and graph cache) per execution keeps traversals consistent and cheap.
 		let client: McpClient | undefined;
 		let graph: GraphSource | undefined;
 		const organisationAt = (i: number) => String(this.getNodeParameter('organisation', i) ?? '').trim();
-		const getClient = (i: number) => (client ??= mcpClientFor(this, this.getNodeParameter('endpointUrl', i) as string));
+		const getClient = (i: number) => (client ??= mcpClientFor(this, this.getNodeParameter('endpointUrl', i) as string, runAuth));
 		const getGraph = (i: number) => (graph ??= new McpGraphSource(getClient(i), organisationAt(i)));
 
 		// Reads one context bundle from the chosen source.
@@ -645,7 +820,8 @@ export class RoleAlpha implements INodeType {
 			if (source === 'agentKey') return (await agentRequest(this, baseUrl, keyring, agentUuid, '/context')) as unknown as ContextBundle;
 			const uuid = agentUuid.trim().toLowerCase();
 			if (!UUID.test(uuid)) throw new NodeOperationError(this.getNode(), `Not an agent UUID: "${agentUuid}"`, { itemIndex: i });
-			return getAgentContext(getClient(i), organisationAt(i), uuid, ((opts.view as string) || 'agent') as ContextView);
+			// Under a run token the caller is the agent, so its own view needs no admin switch.
+			return getAgentContext(getClient(i), organisationAt(i), uuid, (asAgent ? 'caller' : (opts.view as string) || 'agent') as ContextView);
 		};
 
 		if (resource === 'agent' && operation === 'listAgents' && source === 'mcp') {
@@ -863,6 +1039,39 @@ export class RoleAlpha implements INodeType {
 					continue;
 				}
 
+				if (resource === 'tool') {
+					const allowed = String(this.getNodeParameter('allowedTools', i, '') ?? '')
+						.split(',')
+						.map((t) => t.trim())
+						.filter(Boolean);
+					const name = operation === 'listTools' ? 'list' : String(this.getNodeParameter('toolName', i, '') ?? '').trim();
+					try {
+						if (name === '' || name === 'list') {
+							const tools = (await getClient(i).listTools()).filter((t) => allowed.includes(t.name));
+							out.push({ json: { ok: true, tools: tools.map((t) => ({ name: t.name, description: t.description ?? '', arguments: (t.inputSchema ?? {}) as IDataObject })) } as unknown as IDataObject, pairedItem: { item: i } });
+						} else if (!allowed.includes(name)) {
+							out.push({ json: { ok: false, error: `Tool "${name}" is not allowed. Allowed: ${allowed.join(', ')}` }, pairedItem: { item: i } });
+						} else {
+							const raw = this.getNodeParameter('toolArguments', i, '{}') as unknown;
+							let args: Record<string, unknown>;
+							try {
+								args = (typeof raw === 'string' ? (raw.trim() ? JSON.parse(raw) : {}) : raw ?? {}) as Record<string, unknown>;
+							} catch {
+								out.push({ json: { ok: false, error: 'Tool Arguments are not valid JSON' }, pairedItem: { item: i } });
+								continue;
+							}
+							if (!args || typeof args !== 'object' || Array.isArray(args)) args = {};
+							if (args.organisation === undefined) args.organisation = organisationAt(i);
+							out.push({ json: { ok: true, tool: name, result: (await getClient(i).callTool(name, args)) as IDataObject }, pairedItem: { item: i } });
+						}
+					} catch (error) {
+						// A refused run ends the run; any other error goes back to the caller as data.
+						if (error instanceof AgentRunError) throw refusedRun(this, error, i);
+						out.push({ json: { ok: false, tool: name, error: (error as Error).message.slice(0, 1000) }, pairedItem: { item: i } });
+					}
+					continue;
+				}
+
 				if (resource === 'settings') {
 					const raw = parseJsonParam(this, 'settingRows', i);
 					const res = resolveSettings((Array.isArray(raw) ? raw : []) as SettingRow[], {
@@ -894,6 +1103,7 @@ export class RoleAlpha implements INodeType {
 					continue;
 				}
 				if (error instanceof NodeOperationError) throw error;
+				if (error instanceof AgentRunError) throw refusedRun(this, error, i);
 				throw new NodeOperationError(this.getNode(), error as Error, { itemIndex: i });
 			}
 		}

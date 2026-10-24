@@ -232,7 +232,7 @@ const textBundle: ContextBundle = {
 	context: [{ kind: 'role', uuid: TEXT, name: 'Copy', body: { accountabilities: ['Write texts', 'Set the post to review'] } }],
 };
 
-test('share: a hand-over waits on every filled role, an empty role is skipped', async () => {
+test('share: a hand-over waits only on the deliveries it lists', async () => {
 	const step = await getStep(shareGraph(), STEP, { resolveHolders: true, roleDetails: true });
 	const input = buildShareInput(textBundle, step, [TEXT]);
 	assert.deepEqual(input.others.map((o) => [o.name, o.filled]), [['Visual', true], ['Video', false], ['Review', true]]);
@@ -246,9 +246,9 @@ test('share: a hand-over waits on every filled role, an empty role is skipped', 
 	});
 	const handover = res.duties.find((d) => d.id === 'A1.2')!;
 	assert.equal(handover.handover, true);
-	assert.deepEqual(handover.needs.map((n) => n.roleUuid).sort(), [VISUAL, REVIEW].sort());
+	assert.deepEqual(handover.needs.map((n) => n.roleUuid), [VISUAL], 'a filled role that delivers nothing here holds nothing up');
 	assert.equal(res.duties.find((d) => d.id === 'A1.1')!.needs.length, 0);
-	assert.ok(!res.waitRoleUuids.includes(VIDEO));
+	assert.deepEqual(res.waitRoleUuids, [VISUAL]);
 });
 
 test('share: the cache key ignores record data, but not the trigger kind or the roles', async () => {

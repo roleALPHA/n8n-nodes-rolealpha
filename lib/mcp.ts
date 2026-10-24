@@ -102,6 +102,7 @@ export class McpClient {
 	private sessionId?: string;
 	private nextId = 1;
 	private ready?: Promise<void>;
+	private renewing = false;
 
 	constructor(
 		private readonly transport: Transport,
@@ -118,6 +119,18 @@ export class McpClient {
 		const payload: Record<string, unknown> = { jsonrpc: '2.0', method, params };
 		if (id !== undefined) payload.id = id;
 		const reply = await this.transport(payload, headers);
+		// The server forgot the session (e.g. after a release): open a new one once and repeat the call.
+		if (reply.status === 404 && this.sessionId && method !== 'initialize' && !notification && !this.renewing) {
+			this.sessionId = undefined;
+			this.ready = undefined;
+			this.renewing = true;
+			try {
+				await this.initialize();
+				return await this.rpc(method, params);
+			} finally {
+				this.renewing = false;
+			}
+		}
 		const session = header(reply.headers, 'mcp-session-id');
 		if (session) this.sessionId = session;
 		if (reply.status >= 400) {
@@ -141,6 +154,19 @@ export class McpClient {
 			})();
 		}
 		return this.ready;
+	}
+
+	async listTools(): Promise<Array<{ name: string; description?: string; inputSchema?: unknown }>> {
+		await this.initialize();
+		const tools: Array<{ name: string; description?: string; inputSchema?: unknown }> = [];
+		let cursor: string | undefined;
+		for (let page = 0; page < 20; page++) {
+			const res = (await this.rpc('tools/list', cursor ? { cursor } : {})) as { tools?: typeof tools; nextCursor?: string };
+			tools.push(...(res?.tools ?? []));
+			if (!res?.nextCursor) break;
+			cursor = res.nextCursor;
+		}
+		return tools;
 	}
 
 	async callTool(name: string, args: Record<string, unknown>): Promise<unknown> {

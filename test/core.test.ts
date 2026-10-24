@@ -45,6 +45,23 @@ test('McpClient initializes once and keeps the session id', async () => {
 	assert.equal(seen[3].session, 'sess-1');
 });
 
+test('McpClient opens a new session once when the server forgot it, and lists tools page by page', async () => {
+	let session = 0;
+	const seen: string[] = [];
+	const transport = async (body: unknown, headers: Record<string, string>): Promise<HttpReply> => {
+		const b = body as { id?: number; method: string; params?: { cursor?: string } };
+		seen.push(`${b.method}@${headers['Mcp-Session-Id'] ?? '-'}`);
+		if (b.method === 'initialize') return { status: 200, headers: { 'mcp-session-id': `s${++session}` }, body: JSON.stringify({ jsonrpc: '2.0', id: b.id, result: {} }) };
+		if (b.method === 'notifications/initialized') return { status: 202, headers: {}, body: '' };
+		if (headers['Mcp-Session-Id'] === 's1' && seen.filter((x) => x.startsWith('tools/list')).length > 1) return { status: 404, headers: {}, body: 'Session not found' };
+		const page = b.params?.cursor ? { tools: [{ name: 'b' }] } : { tools: [{ name: 'a' }], nextCursor: 'p2' };
+		return { status: 200, headers: {}, body: JSON.stringify({ jsonrpc: '2.0', id: b.id, result: page }) };
+	};
+	const client = new McpClient(transport);
+	assert.deepEqual((await client.listTools()).map((t) => t.name), ['a', 'b'], 'second page fails on s1, a new session repeats it');
+	assert.ok(seen.includes('tools/list@s2'));
+});
+
 test('McpClient surfaces HTTP errors', async () => {
 	const client = new McpClient(async () => ({ status: 401, headers: {}, body: 'unauthorized' }));
 	await assert.rejects(client.callTool('a', {}), /HTTP 401/);
