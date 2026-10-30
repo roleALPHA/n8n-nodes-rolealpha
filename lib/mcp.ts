@@ -126,7 +126,7 @@ export class McpClient {
 
 	constructor(
 		private readonly transport: Transport,
-		private readonly clientName = 'n8n-nodes-rolealpha',
+		private readonly clientName = '@rolealpha/n8n-nodes-rolealpha',
 		private readonly sleep: Sleep = sleepFor,
 	) {}
 
