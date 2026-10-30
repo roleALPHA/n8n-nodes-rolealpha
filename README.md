@@ -270,8 +270,9 @@ npm pack                     # → rolealpha-n8n-nodes-rolealpha-<version>.tgz
 ### Releasing
 
 Bump `version` in `package.json`, commit, and push a tag `v<version>`. The GitHub Action
-**Publish to npm** builds, tests and publishes the package with provenance. It needs the
-repository secret `NPM_TOKEN`, an npm automation token of the `rolealpha` organisation.
+**Publish to npm** builds, tests and publishes the package with provenance. It uses npm
+trusted publishing, so there is no npm token anywhere: on npmjs.com the package settings name
+this repository and the workflow file `publish.yml` as its trusted publisher.
 
 ## Things that trip people up
 
