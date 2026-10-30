@@ -1,6 +1,6 @@
 {
-  "name": "n8n-nodes-rolealpha",
-  "version": "0.4.3",
+  "name": "@rolealpha/n8n-nodes-rolealpha",
+  "version": "0.5.0",
   "description": "n8n nodes for running AI agents whose roles, duties, deciders and guardrails live in roleALPHA",
   "keywords": [
     "n8n-community-node-package",
@@ -10,7 +10,6 @@
     "approval"
   ],
   "license": "MIT",
-  "private": true,
   "author": {
     "name": "roleALPHA GmbH"
   },
@@ -25,6 +24,10 @@
   "files": [
     "dist"
   ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
   "scripts": {
     "build": "tsc && node scripts/copy-icons.mjs",
     "test": "tsc -p tsconfig.test.json && node --test dist-test/test/*.test.js",

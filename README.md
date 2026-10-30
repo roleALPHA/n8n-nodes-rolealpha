@@ -1,4 +1,4 @@
-# n8n-nodes-rolealpha
+# @rolealpha/n8n-nodes-rolealpha
 
 <p align="center"><b>AI agents that know only themselves.</b><br>
 Roles, duties, deciders and guardrails come from roleALPHA, at run time, every time.</p>
@@ -227,11 +227,36 @@ asks for a contact, and roleALPHA GmbH will get back to you.
 
 ### Requirements
 
-- A self-hosted n8n with access to its custom extensions folder
+- A self-hosted n8n that allows community nodes
 - A roleALPHA organisation and an MCP OAuth2 credential for it
-- Node.js and npm to build the package
 
-### Build and install
+### Install
+
+In n8n, open **Settings → Community Nodes → Install** and enter
+`@rolealpha/n8n-nodes-rolealpha`. Or, on the n8n host:
+
+```bash
+cd ~/.n8n/nodes
+npm install @rolealpha/n8n-nodes-rolealpha
+# restart n8n
+```
+
+### Updating
+
+Update the package under **Settings → Community Nodes**, or run
+`npm install @rolealpha/n8n-nodes-rolealpha@latest` in the same folder and restart n8n.
+Workflows keep their nodes. New parameters start with their defaults.
+
+### Coming from `n8n-nodes-rolealpha` (up to 0.4.x)
+
+Up to 0.4.x the package was installed from a tarball under the name `n8n-nodes-rolealpha`.
+n8n stores the package name in every node type, so a node from the old package is
+`n8n-nodes-rolealpha.roleAlpha` and one from this package is
+`@rolealpha/n8n-nodes-rolealpha.roleAlpha`. Both packages can be installed side by side.
+Install this one, switch each workflow's nodes over, and then remove the old package.
+Credentials are not tied to the package name and stay as they are.
+
+### Building from source
 
 ```bash
 git clone https://github.com/roleALPHA/n8n-nodes-rolealpha.git
@@ -239,17 +264,14 @@ cd n8n-nodes-rolealpha
 npm install
 npm run build
 npm test
-npm pack                     # → n8n-nodes-rolealpha-<version>.tgz
-
-# on the n8n host (custom extensions folder, e.g. ~/.n8n/custom):
-npm install /path/to/n8n-nodes-rolealpha-<version>.tgz
-# restart n8n
+npm pack                     # → rolealpha-n8n-nodes-rolealpha-<version>.tgz
 ```
 
-### Updating
+### Releasing
 
-Build and pack the new version, install the tarball over the old one in the same folder,
-and restart n8n. Workflows keep their nodes. New parameters start with their defaults.
+Bump `version` in `package.json`, commit, and push a tag `v<version>`. The GitHub Action
+**Publish to npm** builds, tests and publishes the package with provenance. It needs the
+repository secret `NPM_TOKEN`, an npm automation token of the `rolealpha` organisation.
 
 ## Things that trip people up
 
