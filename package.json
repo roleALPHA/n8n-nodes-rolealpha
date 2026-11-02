@@ -1,13 +1,14 @@
 {
   "name": "@rolealpha/n8n-nodes-rolealpha",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "description": "n8n nodes for running AI agents whose roles, duties, deciders and guardrails live in roleALPHA",
   "keywords": [
     "n8n-community-node-package",
     "rolealpha",
     "agents",
     "governance",
-    "approval"
+    "approval",
+    "workflow-builder"
   ],
   "license": "MIT",
   "author": {
@@ -44,7 +45,8 @@
     "nodes": [
       "dist/nodes/RoleAlpha/RoleAlpha.node.js",
       "dist/nodes/ApprovalSeal/ApprovalSeal.node.js",
-      "dist/nodes/RoleAlphaTrigger/RoleAlphaTrigger.node.js"
+      "dist/nodes/RoleAlphaTrigger/RoleAlphaTrigger.node.js",
+      "dist/nodes/RoleAlphaWorkflowBuilder/RoleAlphaWorkflowBuilder.node.js"
     ]
   },
   "devDependencies": {

@@ -1,0 +1,613 @@
+{
+  "name": "roleALPHA: Workflows follow the organisation",
+  "nodes": [
+    {
+      "id": "7c3116ef-ebf3-5222-9fb1-7d6cc3e17426",
+      "name": "About",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -200,
+        -420
+      ],
+      "parameters": {
+        "content": "## Workflows follow the organisation\nEvery 15 minutes the builder compares the roleALPHA graph with the snapshot table `rolealpha_snapshot` (columns: uuid, entity_type, name, custom_id, fingerprint, fields, edges, seen_at \u2014 all text).\n\nFor every new, changed or removed step, role or agent, the model proposes what that means for the n8n workflows. A usable proposal becomes an **inactive draft**, and every person filling the deciding role of the governing step gets an e-mail with links to approve or reject it (workflow *roleALPHA: Approve workflow drafts*).\n\nSet the values in **Settings** and the credentials (roleALPHA MCP OAuth2, n8n API, Anthropic, SMTP). The first run only stores the snapshot.",
+        "width": 620,
+        "height": 340
+      }
+    },
+    {
+      "id": "cf96f6a1-24ac-5ffe-bff4-d2bb9586bbc8",
+      "name": "Every 15 minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 15
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "c74beeb7-1723-56f3-b2e2-f9f50d47f8b7",
+      "name": "Settings",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        220,
+        0
+      ],
+      "parameters": {
+        "mode": "manual",
+        "assignments": {
+          "assignments": [
+            {
+              "id": "55a07646-eb3b-5977-bc3a-6e2cc5e16995",
+              "name": "endpointUrl",
+              "value": "https://rolealpha.app/api/mcp",
+              "type": "string"
+            },
+            {
+              "id": "17309c31-3785-5c16-b53e-d9d3f138f25e",
+              "name": "organisation",
+              "value": "roleALPHA GmbH",
+              "type": "string"
+            },
+            {
+              "id": "f86905f5-0e6f-5ef7-9d89-51834d18eb3e",
+              "name": "governingStep",
+              "value": "automation:workflow-changes",
+              "type": "string"
+            },
+            {
+              "id": "0b16c2b8-5ae3-5d04-8b12-28796bb3a9fe",
+              "name": "n8nUrl",
+              "value": "https://n8n.example.com",
+              "type": "string"
+            },
+            {
+              "id": "64cde423-336c-52b1-95f0-0e4f6048bf5f",
+              "name": "approvalUrl",
+              "value": "https://n8n.example.com/webhook/rolealpha-workflow-approval",
+              "type": "string"
+            },
+            {
+              "id": "0d356e94-1970-565d-a5ef-92a40e514514",
+              "name": "mailFrom",
+              "value": "n8n@example.com",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "75383fdb-0e1b-5d65-8f5b-07db6c340c27",
+      "name": "Read snapshot",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        440,
+        0
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "rolealpha_snapshot"
+        },
+        "returnAll": true
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "id": "b5da7e1e-bc12-56f5-858c-75e8f9748996",
+      "name": "Detect changes",
+      "type": "@rolealpha/n8n-nodes-rolealpha.roleAlphaWorkflowBuilder",
+      "typeVersion": 1,
+      "position": [
+        660,
+        0
+      ],
+      "parameters": {
+        "operation": "detectChanges",
+        "endpointUrl": "={{ $('Settings').first().json.endpointUrl }}",
+        "organisation": "={{ $('Settings').first().json.organisation }}",
+        "entityTypes": [
+          "process",
+          "role",
+          "agent"
+        ],
+        "snapshotRows": "={{ $('Read snapshot').all().map((i) => i.json) }}",
+        "detectOptions": {}
+      },
+      "executeOnce": true,
+      "credentials": {
+        "mcpOAuth2Api": {
+          "id": "",
+          "name": "roleALPHA MCP"
+        }
+      }
+    },
+    {
+      "id": "76a58d8c-5a80-5b65-8c3d-a3fdfbb873b6",
+      "name": "Rows to store",
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [
+        900,
+        -200
+      ],
+      "parameters": {
+        "fieldToSplitOut": "upsert",
+        "options": {}
+      }
+    },
+    {
+      "id": "3f108940-6e6f-5779-b162-704b7bf5c993",
+      "name": "Store row",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        1120,
+        -200
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "upsert",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "rolealpha_snapshot"
+        },
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "uuid",
+              "condition": "eq",
+              "keyValue": "={{ $json.uuid }}"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": null
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "895fbbca-7dd7-5f5e-b128-eacc8ab6a503",
+      "name": "Rows to remove",
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [
+        900,
+        -40
+      ],
+      "parameters": {
+        "fieldToSplitOut": "remove",
+        "options": {}
+      }
+    },
+    {
+      "id": "e0ac7c93-b860-5cac-bdfa-8283aa07cbb7",
+      "name": "Remove row",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        1120,
+        -40
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "deleteRows",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "rolealpha_snapshot"
+        },
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "uuid",
+              "condition": "eq",
+              "keyValue": "={{ $json.remove }}"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "4bd71dcc-1046-5317-8921-0fb352f14bc8",
+      "name": "Changes",
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [
+        900,
+        160
+      ],
+      "parameters": {
+        "fieldToSplitOut": "changes",
+        "options": {}
+      }
+    },
+    {
+      "id": "919fcce8-887e-59e8-95f4-0b550ae647fb",
+      "name": "Propose",
+      "type": "@rolealpha/n8n-nodes-rolealpha.roleAlphaWorkflowBuilder",
+      "typeVersion": 1,
+      "position": [
+        1120,
+        160
+      ],
+      "parameters": {
+        "operation": "propose",
+        "endpointUrl": "={{ $('Settings').first().json.endpointUrl }}",
+        "organisation": "={{ $('Settings').first().json.organisation }}",
+        "change": "={{ $json }}",
+        "extraRules": "Systems: Directus (collections are named in the domains of the roles).\nThe generic runner is the workflow \"roleALPHA: Runner\"; start it with Execute Workflow and pass agentUuid, step and trigger.",
+        "maxAttempts": 2
+      },
+      "credentials": {
+        "mcpOAuth2Api": {
+          "id": "",
+          "name": "roleALPHA MCP"
+        },
+        "n8nApi": {
+          "id": "",
+          "name": "n8n API"
+        }
+      }
+    },
+    {
+      "id": "6092e34e-dd97-5595-b9bc-2f8e01fe8556",
+      "name": "Claude",
+      "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
+      "typeVersion": 1.6,
+      "position": [
+        1120,
+        380
+      ],
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "mode": "id",
+          "value": "claude-opus-5-5"
+        },
+        "options": {
+          "maxTokensToSample": 16000
+        }
+      },
+      "credentials": {
+        "anthropicApi": {
+          "id": "",
+          "name": "Anthropic"
+        }
+      }
+    },
+    {
+      "id": "c1f48a38-75f5-5be0-a160-1bc6f73589e0",
+      "name": "Usable proposal?",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2.3,
+      "position": [
+        1340,
+        160
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "56978cfb-d78a-50c2-92e4-b5dc1a9f42c0",
+              "leftValue": "={{ $json.ok }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            },
+            {
+              "id": "683443a7-e5f8-543b-b844-83dbbaccaafb",
+              "leftValue": "={{ $json.action }}",
+              "rightValue": "none",
+              "operator": {
+                "type": "string",
+                "operation": "notEquals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "0db21a50-5917-53d8-b45f-c00ed605b9b7",
+      "name": "Create draft",
+      "type": "@rolealpha/n8n-nodes-rolealpha.roleAlphaWorkflowBuilder",
+      "typeVersion": 1,
+      "position": [
+        1560,
+        160
+      ],
+      "parameters": {
+        "operation": "createDraft",
+        "proposal": "={{ $json }}"
+      },
+      "credentials": {
+        "n8nApi": {
+          "id": "",
+          "name": "n8n API"
+        }
+      }
+    },
+    {
+      "id": "30eb7020-a877-50d4-8ec1-8ddf1d3bd0b6",
+      "name": "Who decides",
+      "type": "@rolealpha/n8n-nodes-rolealpha.roleAlpha",
+      "typeVersion": 1,
+      "position": [
+        1780,
+        160
+      ],
+      "parameters": {
+        "resource": "responsibility",
+        "operation": "getDecider",
+        "endpointUrl": "={{ $('Settings').first().json.endpointUrl }}",
+        "organisation": "={{ $('Settings').first().json.organisation }}",
+        "step": "={{ $('Settings').first().json.governingStep }}",
+        "responsibilityOptions": {}
+      },
+      "credentials": {
+        "mcpOAuth2Api": {
+          "id": "",
+          "name": "roleALPHA MCP"
+        }
+      }
+    },
+    {
+      "id": "fa892d1a-0ed8-5144-bed0-5db0c98d744f",
+      "name": "Deciding roles",
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [
+        2000,
+        160
+      ],
+      "parameters": {
+        "fieldToSplitOut": "roles",
+        "options": {}
+      }
+    },
+    {
+      "id": "e767080e-069b-54e6-8be8-12d3270c7a8f",
+      "name": "Persons",
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [
+        2220,
+        160
+      ],
+      "parameters": {
+        "fieldToSplitOut": "holders.persons",
+        "options": {}
+      }
+    },
+    {
+      "id": "cf563ccb-3559-5c00-ad9a-b9a048aaea27",
+      "name": "Ask for approval",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        2440,
+        160
+      ],
+      "parameters": {
+        "operation": "send",
+        "fromEmail": "={{ $('Settings').first().json.mailFrom }}",
+        "toEmail": "={{ $json.email }}",
+        "subject": "=Workflow change to approve: {{ $('Create draft').item.json.draftName }}",
+        "emailFormat": "html",
+        "html": "=<p>{{ $('Create draft').item.json.entityName }} was {{ $('Create draft').item.json.change }} in roleALPHA. The model proposes to <b>{{ $('Create draft').item.json.action }}</b> a workflow:</p><blockquote>{{ $('Create draft').item.json.reason }}</blockquote>{{ $('Create draft').item.json.notes.length ? '<p>Before approving: ' + $('Create draft').item.json.notes.join('; ') + '</p>' : '' }}<p><a href=\"{{ $('Settings').first().json.n8nUrl }}/workflow/{{ $('Create draft').item.json.draftId }}\">Look at the draft</a></p><p><a href=\"{{ $('Settings').first().json.approvalUrl }}?draftId={{ $('Create draft').item.json.draftId }}&hash={{ $('Create draft').item.json.contentHash }}&decision=approve\">Approve</a> \u00b7 <a href=\"{{ $('Settings').first().json.approvalUrl }}?draftId={{ $('Create draft').item.json.draftId }}&decision=reject\">Reject</a></p><p>You get this because you fill {{ $('Deciding roles').item.json.name }}.</p>",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "credentials": {
+        "smtp": {
+          "id": "",
+          "name": "SMTP"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Every 15 minutes": {
+      "main": [
+        [
+          {
+            "node": "Settings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Settings": {
+      "main": [
+        [
+          {
+            "node": "Read snapshot",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read snapshot": {
+      "main": [
+        [
+          {
+            "node": "Detect changes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Detect changes": {
+      "main": [
+        [
+          {
+            "node": "Rows to store",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Rows to remove",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Changes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rows to store": {
+      "main": [
+        [
+          {
+            "node": "Store row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rows to remove": {
+      "main": [
+        [
+          {
+            "node": "Remove row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Changes": {
+      "main": [
+        [
+          {
+            "node": "Propose",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claude": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Propose",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Propose": {
+      "main": [
+        [
+          {
+            "node": "Usable proposal?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Usable proposal?": {
+      "main": [
+        [
+          {
+            "node": "Create draft",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create draft": {
+      "main": [
+        [
+          {
+            "node": "Who decides",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Who decides": {
+      "main": [
+        [
+          {
+            "node": "Deciding roles",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Deciding roles": {
+      "main": [
+        [
+          {
+            "node": "Persons",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Persons": {
+      "main": [
+        [
+          {
+            "node": "Ask for approval",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
