@@ -45,6 +45,9 @@ next run follows. You don't edit code and you don't republish anything.
 - **Teams of agents on one step.** Several roles share a step. Each agent does its own part,
   waits for what it needs and is woken when it arrives. Agents that hang are escalated to
   the role that leads their circle.
+- **Workflows that follow the organisation.** When a step, role or agent is created, changed
+  or removed in roleALPHA, a model proposes what that means for the n8n workflows. The
+  proposal becomes an inactive draft, and only a person filling the deciding role can apply it.
 - **Limits you can change without republishing.** Retries, wait times, run time and tool
   calls come from a settings table and are clamped to fixed bounds.
 
@@ -125,6 +128,54 @@ bound to the account does not run. There is no fallback to the view of the accou
 Approval gates follow this order: **Get Decider → Check Approver → Approval Seal: Sign**. The
 workflow that sends runs **Approval Seal: Verify** first and stops if the content changed.
 
+## Workflows that follow the organisation
+
+Most changes in roleALPHA need no workflow change at all: the runner reads roles, duties and
+deciders on every run. What roleALPHA cannot know is technology: a new step needs a trigger, a
+schedule or a mapping of (collection, status) to its custom ID. The **roleALPHA Workflow
+Builder** closes that gap without letting a model change production on its own.
+
+```
+Scheduler (every 15 min)
+ └ Data table: snapshot rows
+   └ Workflow Builder: Detect Changes        new / changed / removed steps, roles, agents
+     ├ store and remove snapshot rows
+     └ per change: Workflow Builder: Propose  ← chat model
+                    └ Create Draft            inactive, tagged rolealpha-draft
+                      └ roleALPHA: Get Decider (governing step) → e-mail to each person
+
+Approval link (behind single sign-on)
+ └ roleALPHA: Check Approver (governing step, fail-closed)
+   ├ approve → Workflow Builder: Apply Draft   only with the hash that was sent out
+   └ reject  → Workflow Builder: Discard Draft
+```
+
+**Detect** compares a fingerprint of every watched entity (name, custom ID, attributes and
+edges) with the rows stored last time. The first run only stores the snapshot. An entity that
+cannot be read is neither changed nor removed; removals count only when the complete index was
+read.
+
+**Propose** gives the model the change, the entity as roleALPHA shows it now (a step with its
+roles, never persons), the managed workflows and the credentials they use. Its answer is
+checked, and a failed check goes back to the model once more with the problems:
+
+- only node types from the allow list (no Code node by default),
+- no e-mail address and no UUID in any parameter: those are read from roleALPHA at run time,
+- only credentials already used by managed workflows; a node that stays keeps its own
+  credentials, IDs and webhook IDs,
+- updates and deactivations only of managed workflows, connections only between existing nodes.
+
+**Drafts** carry everything Apply needs in a sticky note named `roleALPHA binding`: the action,
+the target, the target's version and the content hash. **Apply** refuses when the draft no
+longer has the approved hash or the target changed after the draft was made. A managed workflow
+is one with that note and the tag `rolealpha-managed`; nothing else is ever touched.
+
+Two ready workflows are in [`examples/`](examples): import
+`workflows-follow-the-organisation.json` and `approve-workflow-drafts.json`, create a data table
+`rolealpha_snapshot` with the text columns `uuid, entity_type, name, custom_id, fingerprint,
+fields, edges, seen_at`, fill in **Settings** and the credentials, and give a step in roleALPHA
+(the governing step, e.g. `automation:workflow-changes`) a deciding role.
+
 ## Nodes
 
 ### roleALPHA (`roleAlpha`)
@@ -153,6 +204,17 @@ workflow that sends runs **Approval Seal: Verify** first and stops if the conten
 | Settings | Resolve | Runner limits from defaults and a settings table (`scope, target, key, value`): default < global < step < agent. Every value is clamped to fixed bounds; unknown keys and unusable values are reported in `settingProblems` and never applied. | – |
 | Schedule | Is Due | Decides from the step `frequency` (and `termin` / due date) whether a run is due in the current period. | – |
 
+### roleALPHA Workflow Builder (`roleAlphaWorkflowBuilder`)
+
+| Operation | What it does | Credential |
+|---|---|---|
+| Detect Changes | Compares the watched entity types (default: process, role, agent) with the stored snapshot rows. Returns `changes` (`created`, `changed` with `changedFields`, `edgesAdded`, `edgesRemoved`, `removed`), the rows to `upsert` and `remove`, and `unreadable`. | MCP OAuth2 |
+| List Workflows | The managed workflows with their bound entities and the credentials they use. | n8n API |
+| Propose | Needs a chat model on its **Model** input. Returns `ok`, `action` (`create`, `update`, `deactivate`, `none`), `reason`, `workflow`, `contentHash`, `problems` and `notes`. | MCP OAuth2, n8n API |
+| Create Draft | Stores a proposal with `ok = true` as an inactive draft. Returns `draftId` and `contentHash`. | n8n API |
+| Apply Draft | Applies a draft given the approved hash. Optionally activates a new workflow. | n8n API |
+| Discard Draft | Deletes a draft; refuses any workflow that is not a draft. | n8n API |
+
 ### Approval Seal (`approvalSeal`)
 
 `Sign` seals exactly the approved content together with the approver. Use it after **Check
@@ -177,6 +239,7 @@ under the agent → *Context & Access*.
 | **MCP OAuth2** (n8n built-in) | Access to the roleALPHA MCP endpoint for one organisation. Used for agents (default source) and for every traversal. The `agent` view needs admin rights on the tenant. For **Connect As: Agent** it must be a roleALPHA function account (grant type Client Credentials) whose role has `agent:run` and that may run the agent ("May run these agents"). |
 | **roleALPHA Agent Keys API** | Optional, for the `Agent Keys` source. `baseUrl` of the data node, and `keys`: `{"<agent uuid>": "agt_…"}`, or a list of `{agentUuid, key, label}`. An agent key reads only its own agent, so it cannot traverse. |
 | **roleALPHA Webhook API** | One signing secret, a JSON list of secrets, or a map from agent UUID to secret. |
+| **n8n API** (n8n built-in) | API key and base URL (`https://<host>/api/v1`) of the n8n instance the Workflow Builder manages. |
 | **Approval Seal API** | `key` (sign and verify) and optionally `legacyKey` (verify v2 only). |
 
 Agent keys and webhook secrets are issued in the roleALPHA interface and shown only once.
@@ -216,6 +279,9 @@ record_keys, event, run_id, attempts, progress, at`.
 - The prompt marks trigger payloads as data. Guardrails take precedence over event content.
 - Keep `requireActive` and `requireGuardrails` on in production.
 - Settings are clamped to fixed bounds.
+- The Workflow Builder never activates or changes a workflow by itself. A proposal is an
+  inactive draft; Apply needs the hash that was sent to the approver and a target that did not
+  change since. Approval runs through Check Approver, so the webhook needs a signed-in address.
 - Duplicate runs are blocked by leases, and wake-ups are claimed before they fire.
 - No credentials are kept in wait, settings or cache rows. The share cache key holds no
   record content, and a cached answer is checked again like a fresh one.
@@ -314,6 +380,10 @@ not caught by the graph.
 | `MCP initialize failed with HTTP 429` | Many runs started at once and roleALPHA turned some away. The client repeats a call turned away with 429 or 503 up to four times (Retry-After, else 1, 2, 4, 8 s). If it still fails, start fewer runs at once. |
 | `Empty MCP response` | The server answered with no body. Reading calls are repeated; a writing tool is not, so it cannot run twice. |
 | `Cannot access "arguments" due to security concerns` | n8n blocks the name `arguments` in expressions and in `$fromAI`. Name the tool input `toolArgs` or `args`. |
+| Propose returns `ok: false` | The model's answer failed the check twice; `problems` says why. Often a node type outside the allow list or a hard-coded address. Add what the model needs to **Extra Rules**. |
+| `The draft changed after it was proposed or approved` | Somebody edited the draft, or the link carries another hash. Discard it; the next change proposes again. |
+| `Workflow … changed after the draft was made` | The target was edited after the draft. Discard the draft and let the builder propose again. |
+| Detect fails with `more than Max Entities` | Every watched entity costs two reads per run. Watch fewer types or raise the limit. |
 | Webhook answers `401` | The `X-RA-Signature` does not match. Check the secret in **roleALPHA Webhook API**. |
 
 ## Licence

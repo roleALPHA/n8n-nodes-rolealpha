@@ -1,0 +1,343 @@
+{
+  "name": "roleALPHA: Approve workflow drafts",
+  "nodes": [
+    {
+      "id": "7c3116ef-ebf3-5222-9fb1-7d6cc3e17426",
+      "name": "About",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -200,
+        -400
+      ],
+      "parameters": {
+        "content": "## Approve workflow drafts\nThe links in the approval e-mail land here. **Put this webhook behind your single sign-on proxy** (e.g. oauth2-proxy): the proxy signs the person in and passes the address in `X-Auth-Request-Email`. Without it anybody holding the link could claim to be the approver.\n\n**Check Approver** then asks roleALPHA whether that person fills the deciding role of the governing step right now (fail-closed). Approve applies the draft only if it still has the hash that was sent out; reject deletes the draft.",
+        "width": 620,
+        "height": 300
+      }
+    },
+    {
+      "id": "440cdf20-15c7-5bb3-a1cd-307fb3aef2c9",
+      "name": "Approval link",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "httpMethod": "GET",
+        "path": "rolealpha-workflow-approval",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "webhookId": "0d4378cb-52a7-5f9e-8938-f7e28db3281c"
+    },
+    {
+      "id": "c74beeb7-1723-56f3-b2e2-f9f50d47f8b7",
+      "name": "Settings",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        220,
+        0
+      ],
+      "parameters": {
+        "mode": "manual",
+        "assignments": {
+          "assignments": [
+            {
+              "id": "55a07646-eb3b-5977-bc3a-6e2cc5e16995",
+              "name": "endpointUrl",
+              "value": "https://rolealpha.app/api/mcp",
+              "type": "string"
+            },
+            {
+              "id": "17309c31-3785-5c16-b53e-d9d3f138f25e",
+              "name": "organisation",
+              "value": "roleALPHA GmbH",
+              "type": "string"
+            },
+            {
+              "id": "f86905f5-0e6f-5ef7-9d89-51834d18eb3e",
+              "name": "governingStep",
+              "value": "automation:workflow-changes",
+              "type": "string"
+            },
+            {
+              "id": "091d89dd-531c-5199-96e9-5491ead2244d",
+              "name": "identityHeader",
+              "value": "x-auth-request-email",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "1b8e2296-3a4c-57b6-b135-85e1c1a930b5",
+      "name": "May decide?",
+      "type": "@rolealpha/n8n-nodes-rolealpha.roleAlpha",
+      "typeVersion": 1,
+      "position": [
+        440,
+        0
+      ],
+      "parameters": {
+        "resource": "responsibility",
+        "operation": "checkApprover",
+        "endpointUrl": "={{ $('Settings').first().json.endpointUrl }}",
+        "organisation": "={{ $('Settings').first().json.organisation }}",
+        "step": "={{ $('Settings').first().json.governingStep }}",
+        "actor": "={{ $('Approval link').item.json.headers[$('Settings').first().json.identityHeader] ?? '' }}",
+        "responsibilityOptions": {}
+      },
+      "credentials": {
+        "mcpOAuth2Api": {
+          "id": "",
+          "name": "roleALPHA MCP"
+        }
+      }
+    },
+    {
+      "id": "8a3e7f9f-cf28-5e13-8a89-6d212e363c3b",
+      "name": "Allowed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        660,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "b56a56e2-3c71-51a7-8a3e-cb62d327b8f1",
+              "leftValue": "={{ $json.allowed }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "c7cbd30d-038a-514b-a0ab-a73ec7ea2853",
+      "name": "Approve?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        880,
+        -100
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "989fb47b-7d43-55f4-a4f8-acf2cc03915a",
+              "leftValue": "={{ $('Approval link').item.json.query.decision }}",
+              "rightValue": "approve",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "407afb12-1a34-58b5-a489-fae4be2d1f89",
+      "name": "Apply draft",
+      "type": "@rolealpha/n8n-nodes-rolealpha.roleAlphaWorkflowBuilder",
+      "typeVersion": 1,
+      "position": [
+        1100,
+        -200
+      ],
+      "parameters": {
+        "operation": "applyDraft",
+        "draftId": "={{ $('Approval link').item.json.query.draftId }}",
+        "approvedHash": "={{ $('Approval link').item.json.query.hash }}",
+        "activate": false
+      },
+      "credentials": {
+        "n8nApi": {
+          "id": "",
+          "name": "n8n API"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "7e6e3a6e-5650-5f1c-a77a-932d8ce7a0e2",
+      "name": "Discard draft",
+      "type": "@rolealpha/n8n-nodes-rolealpha.roleAlphaWorkflowBuilder",
+      "typeVersion": 1,
+      "position": [
+        1100,
+        0
+      ],
+      "parameters": {
+        "operation": "discardDraft",
+        "draftId": "={{ $('Approval link').item.json.query.draftId }}"
+      },
+      "credentials": {
+        "n8nApi": {
+          "id": "",
+          "name": "n8n API"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "e7b1d874-01fc-51a3-871a-0127a374142a",
+      "name": "Done",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        1320,
+        -100
+      ],
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.error ? 'Nothing was changed: ' + $json.error : ($json.applied ? 'Applied: ' + $json.action + ' workflow ' + $json.workflowId + ($json.activated ? ' (active)' : ' (inactive, activate it in n8n)') : 'The draft was discarded.') }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "6b7bd49e-4d1d-5133-9761-d76dcf4e934e",
+      "name": "Not allowed",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        880,
+        160
+      ],
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "=Not allowed: {{ $json.reason }}",
+        "options": {
+          "responseCode": 403
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Approval link": {
+      "main": [
+        [
+          {
+            "node": "Settings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Settings": {
+      "main": [
+        [
+          {
+            "node": "May decide?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "May decide?": {
+      "main": [
+        [
+          {
+            "node": "Allowed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Allowed?": {
+      "main": [
+        [
+          {
+            "node": "Approve?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Not allowed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Approve?": {
+      "main": [
+        [
+          {
+            "node": "Apply draft",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Discard draft",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply draft": {
+      "main": [
+        [
+          {
+            "node": "Done",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Discard draft": {
+      "main": [
+        [
+          {
+            "node": "Done",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
