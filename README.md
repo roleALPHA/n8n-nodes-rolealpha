@@ -180,11 +180,47 @@ draft, and a second use finds none. Whether the person may decide is checked whe
 confirm, not when the mail was sent, so a link of somebody who left the role does nothing.
 Opening a link only shows a confirm page; mail scanners that open links decide nothing.
 
-Two ready workflows are in [`examples/`](examples): import
-`workflows-follow-the-organisation.json` and `approve-workflow-drafts.json`, create a data table
-`rolealpha_snapshot` with the text columns `uuid, entity_type, name, custom_id, fingerprint,
-fields, edges, seen_at`, fill in **Settings** and the credentials, and give a step in roleALPHA
-(the governing step, e.g. `automation:workflow-changes`) a deciding role.
+### Setting it up
+
+Two ready workflows are in [`examples/`](examples). Installing the package does not set them
+up: n8n runs no code of a community package at install, so the data table and the credentials
+have to be created once by hand.
+
+1. **Create the data table.** In n8n open the project the workflows will live in (e.g.
+   *Personal*), go to the tab *Data tables*, create a table named `rolealpha_snapshot` and add
+   these columns, all of type **String**:
+
+   | Column | Holds |
+   |---|---|
+   | `uuid` | UUID of the entity (key of the row) |
+   | `entity_type` | `process`, `role`, `agent` … |
+   | `name` | Name at the last run |
+   | `custom_id` | Custom ID, may be empty |
+   | `fingerprint` | Hash over name, custom ID, attributes and edges |
+   | `fields` | JSON: a short hash per attribute |
+   | `edges` | JSON: the edges as `TYPE>uuid` / `TYPE<uuid` |
+   | `seen_at` | Time of the run that stored the row |
+
+   The name must be exactly `rolealpha_snapshot`; the example finds the table by name. Without
+   it, *Read snapshot* fails and nothing is detected.
+2. **Create the credentials** (see [Credentials](#credentials)):
+   - **MCP OAuth2** for roleALPHA. It must read the whole organisation, not just one agent.
+   - **n8n API** with an API key from *Settings → n8n API*. When `/api` is not reachable from
+     outside, use `http://localhost:5678/api/v1` as base URL.
+   - **Approval Seal API** with a random key of at least 32 characters. It signs the approval
+     links; keep it secret, anybody with it can make links.
+   - A chat model (e.g. **Anthropic**) and **SMTP** for the approval e-mails.
+3. **Import both workflows**, `workflows-follow-the-organisation.json` and
+   `approve-workflow-drafts.json`, and pick the credentials on every node that asks for one.
+4. **Fill in Settings** in both workflows: `endpointUrl` and `organisation` of roleALPHA,
+   `governingStep`, and in the first one `n8nUrl`, `approvalUrl` (`<n8nUrl>/webhook/rolealpha-workflow-approval`)
+   and `mailFrom`.
+5. **Give the governing step a deciding role** in roleALPHA (e.g. a step with the custom ID
+   `automation:workflow-changes`). Its holders get the approval e-mails; without one nobody may
+   approve, and every draft stays a draft.
+6. **Activate** *Approve workflow drafts* first, then *Workflows follow the organisation*. The
+   first run only fills the data table and reports nothing; changes are reported from the
+   second run on.
 
 ## Nodes
 
