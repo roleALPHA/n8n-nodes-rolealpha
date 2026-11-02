@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { detectChanges, readSnapshots, snapshotOf, toRow, type EntityChange } from '../lib/changes';
+import { detectChanges, PENDING, readSnapshots, snapshotOf, toRow, type EntityChange } from '../lib/changes';
 import {
 	applyDraft,
 	checkPlan,
@@ -68,7 +68,7 @@ test('An unchanged entity and volatile attributes report nothing', () => {
 
 test('An unreadable entity is neither changed nor removed, and rows of other types stay', async () => {
 	const graph = new FakeGraph({ [STEP]: { name: 'Review', type: 'Value Creation' } }, [], new Set([STEP]));
-	const read = await readSnapshots(graph, [{ uuid: STEP, name: 'Review', entityType: 'process' }]);
+	const read = await readSnapshots(graph, [{ uuid: STEP, name: 'Review', entityType: 'process' }], 2, { sleep: async () => {} });
 	assert.equal(read.unreadable.length, 1);
 	const previous = [toRow(snap(STEP, 'Review'), 'x'), toRow(snap(ROLE, 'Copy', {}, [], 'role'), 'x')];
 	const res = detectChanges(previous, read.snapshots, { complete: true, types: ['process'], unreadable: read.unreadable });
@@ -76,6 +76,42 @@ test('An unreadable entity is neither changed nor removed, and rows of other typ
 	assert.deepEqual(res.remove, []);
 	const partial = detectChanges(previous, [], { complete: false, types: ['process', 'role'] });
 	assert.deepEqual(partial.remove, [], 'without the complete index nothing counts as removed');
+});
+
+test('Entities the server turned away are read again one by one after a pause', async () => {
+	let calls = 0;
+	const busy = new Set([STEP, ROLE]);
+	const src: any = {
+		details: async (uuid: string) => {
+			calls++;
+			if (busy.delete(uuid)) throw new Error('MCP tools/call failed with HTTP 429');
+			return { name: uuid === STEP ? 'Review' : 'Copy', customId: null, data: {} };
+		},
+		relationships: async () => [],
+	};
+	const pauses: number[] = [];
+	const read = await readSnapshots(src, [{ uuid: STEP, name: 'Review', entityType: 'process' }, { uuid: ROLE, name: 'Copy', entityType: 'role' }, { uuid: AGENT, name: 'Bot', entityType: 'agent' }], 2, { pauseMs: 5, sleep: async (ms) => void pauses.push(ms) });
+	assert.deepEqual(read.unreadable, []);
+	assert.equal(read.snapshots.length, 3);
+	assert.deepEqual(pauses, [5]);
+	assert.equal(calls, 5);
+});
+
+test('An entity unreadable in the first run is taken in silently later; a new one unreadable later is reported when read', () => {
+	const unreadable = [{ uuid: ROLE, name: 'Copy', entityType: 'role', error: '429' }];
+	const first = detectChanges([], [snap(STEP, 'Review')], { complete: true, types: ['process', 'role'], unreadable, now: NOW });
+	assert.equal(first.baseline, true);
+	assert.deepEqual(first.upsert.map((r) => [r.uuid, r.entity_type, r.fingerprint === PENDING]), [[STEP, 'process', false], [ROLE, 'role', true]]);
+	const second = detectChanges(first.upsert, [snap(STEP, 'Review'), snap(ROLE, 'Copy', {}, [], 'role')], { complete: true, types: ['process', 'role'] });
+	assert.deepEqual(second.changes, [], 'its first snapshot is no change');
+	assert.deepEqual(second.upsert.map((r) => r.uuid), [ROLE]);
+	const later = detectChanges(second.upsert.concat(first.upsert.filter((r) => r.uuid === STEP)), [snap(STEP, 'Review'), snap(ROLE, 'Copy', {}, [], 'role')], {
+		complete: true, types: ['process', 'role', 'agent'], unreadable: [{ uuid: AGENT, name: 'Bot', entityType: 'agent', error: '429' }],
+	});
+	assert.deepEqual(later.upsert, [], 'no pending row outside the first run');
+	assert.deepEqual(later.changes, []);
+	const read = detectChanges(second.upsert.concat(first.upsert.filter((r) => r.uuid === STEP)), [snap(STEP, 'Review'), snap(ROLE, 'Copy', {}, [], 'role'), snap(AGENT, 'Bot', {}, [], 'agent')], { complete: true, types: ['process', 'role', 'agent'] });
+	assert.deepEqual(read.changes.map((c) => [c.change, c.uuid]), [['created', AGENT]]);
 });
 
 // ---------------------------------------------------------------- the check

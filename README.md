@@ -155,7 +155,9 @@ Confirm button (POST)
 **Detect** compares a fingerprint of every watched entity (name, custom ID, attributes and
 edges) with the rows stored last time. The first run only stores the snapshot. An entity that
 cannot be read is neither changed nor removed; removals count only when the complete index was
-read.
+read. Entities the server turns away (e.g. rate limit) are read once more one by one after a
+pause. One that stays unreadable in the first run gets a row with the fingerprint `pending` and
+is taken in silently once it can be read, instead of being reported as new.
 
 **Propose** gives the model the change, the entity as roleALPHA shows it now (a step with its
 roles, never persons), the managed workflows and the credentials they use. Its answer is
