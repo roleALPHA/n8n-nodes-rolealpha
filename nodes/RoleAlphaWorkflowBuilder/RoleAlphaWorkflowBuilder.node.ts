@@ -107,7 +107,8 @@ const properties: INodeProperties[] = [
 				displayName: 'Parallel Reads',
 				name: 'concurrency',
 				type: 'number',
-				default: 4,
+				default: 2,
+				description: 'Entities read at the same time. Entities the server turned away are read once more one by one after a pause.',
 				typeOptions: { minValue: 1, maxValue: 10 },
 			},
 		],
@@ -345,7 +346,7 @@ export class RoleAlphaWorkflowBuilder implements INodeType {
 			if (entries.length > max) {
 				throw new NodeOperationError(this.getNode(), `The watched types hold ${entries.length} entities, more than Max Entities (${max}); narrow the types or raise the limit`);
 			}
-			const read = await readSnapshots(getGraph(0), entries, typeof opts.concurrency === 'number' ? opts.concurrency : 4);
+			const read = await readSnapshots(getGraph(0), entries, typeof opts.concurrency === 'number' ? opts.concurrency : 2);
 			const res = detectChanges(parseJsonParam(this, 'snapshotRows', 0), read.snapshots, {
 				complete: true,
 				types,

@@ -5,12 +5,17 @@
  *
  * Fail-closed: an entity that could not be read is neither new nor changed nor removed;
  * its old row stays. Removals are reported only when the complete index was read.
+ * An entity that could not be read in the first run gets a pending row, so that it is
+ * taken in silently later instead of being reported as new.
  */
 
 import { createHash } from 'crypto';
 import { canonicalJson } from './seal';
 import type { GraphSource, Relationship } from './graph';
-import type { McpClient } from './mcp';
+import type { McpClient, Sleep } from './mcp';
+
+/** Fingerprint of a row for an entity that existed in the first run but could not be read. */
+export const PENDING = 'pending';
 
 /** Entity types of the lean index (list_entities). */
 export const ENTITY_TYPES = ['process', 'role', 'agent', 'policy', 'organigramm', 'project', 'okr', 'person'] as const;
@@ -71,7 +76,7 @@ export interface DetectResult {
 	/** UUIDs whose rows are deleted. */
 	remove: string[];
 	/** Entities that could not be read this time; their rows stay as they are. */
-	unreadable: Array<{ uuid: string; name: string; error: string }>;
+	unreadable: Array<{ uuid: string; name: string; entityType?: string; error: string }>;
 }
 
 function hash(value: unknown, length = 16): string {
@@ -164,7 +169,8 @@ export function detectChanges(
 		const old = before.get(snap.uuid);
 		if (old && old.fingerprint === snap.fingerprint) continue;
 		upsert.push(toRow(snap, now));
-		if (baseline) continue;
+		// Part of the first run, only read now: its first snapshot, not a change.
+		if (baseline || old?.fingerprint === PENDING) continue;
 		if (!old) {
 			changes.push({ change: 'created', uuid: snap.uuid, name: snap.name, entityType: snap.entityType, customId: snap.customId, previousName: null, changedFields: [], edgesAdded: snap.edges, edgesRemoved: [] });
 			continue;
@@ -186,6 +192,15 @@ export function detectChanges(
 			edgesAdded: snap.edges.filter((e) => !oldEdges.has(e)),
 			edgesRemoved: [...oldEdges].filter((e) => !newEdges.has(e)).sort(),
 		});
+	}
+
+	if (baseline) {
+		for (const u of unreadable) {
+			const uuid = u.uuid.toLowerCase();
+			if (before.has(uuid)) continue;
+			if (!u.entityType || !types.has(u.entityType)) continue;
+			upsert.push({ uuid, entity_type: u.entityType, name: u.name, custom_id: null, fingerprint: PENDING, fields: '{}', edges: '[]', seen_at: now });
+		}
 	}
 
 	const remove: string[] = [];
@@ -243,18 +258,41 @@ export interface SnapshotRead {
 	unreadable: DetectResult['unreadable'];
 }
 
-/** Reads details and relationships of every index entry. A failed read marks the entity unreadable. */
-export async function readSnapshots(src: GraphSource, entries: IndexEntry[], concurrency = 4): Promise<SnapshotRead> {
+/**
+ * Reads details and relationships of every index entry. Entries the server turned away
+ * (e.g. rate limit) are read once more one by one after a pause; what still fails is
+ * marked unreadable.
+ */
+export async function readSnapshots(
+	src: GraphSource,
+	entries: IndexEntry[],
+	concurrency = 2,
+	opts: { pauseMs?: number; sleep?: Sleep } = {},
+): Promise<SnapshotRead> {
 	const snapshots: EntitySnapshot[] = [];
-	const unreadable: DetectResult['unreadable'] = [];
+	const failed: Array<{ entry: IndexEntry; error: unknown }> = [];
+	const read = async (entry: IndexEntry) => {
+		const [details, rels] = await Promise.all([src.details(entry.uuid), src.relationships(entry.uuid)]);
+		snapshots.push(snapshotOf(entry, details, rels));
+	};
 	await pool(entries, concurrency, async (entry) => {
 		try {
-			const [details, rels] = await Promise.all([src.details(entry.uuid), src.relationships(entry.uuid)]);
-			snapshots.push(snapshotOf(entry, details, rels));
+			await read(entry);
 		} catch (error) {
-			unreadable.push({ uuid: entry.uuid, name: entry.name, error: String((error as Error).message ?? error).slice(0, 300) });
+			failed.push({ entry, error });
 		}
 	});
+	const unreadable: DetectResult['unreadable'] = [];
+	if (failed.length > 0) {
+		await (opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms))))(opts.pauseMs ?? 10_000);
+		for (const { entry } of failed) {
+			try {
+				await read(entry);
+			} catch (error) {
+				unreadable.push({ uuid: entry.uuid, name: entry.name, entityType: entry.entityType, error: String((error as Error).message ?? error).slice(0, 300) });
+			}
+		}
+	}
 	snapshots.sort((a, b) => a.uuid.localeCompare(b.uuid));
 	return { snapshots, unreadable };
 }
