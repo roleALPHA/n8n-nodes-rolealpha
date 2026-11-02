@@ -142,11 +142,13 @@ Scheduler (every 15 min)
      ├ store and remove snapshot rows
      └ per change: Workflow Builder: Propose  ← chat model
                     └ Create Draft            inactive, tagged rolealpha-draft
-                      └ roleALPHA: Get Decider (governing step) → e-mail to each person
+                      └ roleALPHA: Get Decider (governing step)
+                        └ per person: Issue Approval Tokens → e-mail with approve / reject link
 
-Approval link (behind single sign-on)
- └ roleALPHA: Check Approver (governing step, fail-closed)
-   ├ approve → Workflow Builder: Apply Draft   only with the hash that was sent out
+Approval link (GET)  → Verify Approval Token → page with a confirm button
+Confirm button (POST)
+ └ Verify Approval Token → roleALPHA: Check Approver (governing step, fail-closed)
+   ├ approve → Workflow Builder: Apply Draft   only with the hash in the token
    └ reject  → Workflow Builder: Discard Draft
 ```
 
@@ -169,6 +171,14 @@ checked, and a failed check goes back to the model once more with the problems:
 the target, the target's version and the content hash. **Apply** refuses when the draft no
 longer has the approved hash or the target changed after the draft was made. A managed workflow
 is one with that note and the tag `rolealpha-managed`; nothing else is ever touched.
+
+**Approval links** carry a token signed with the Approval Seal key: `at1.<claims>.<HMAC>`. It
+names the draft, its content hash, one person and one decision, and it expires (7 days by
+default, at most 30). Nobody can make or change one without the key, so the approval webhook
+can be public and needs no single sign-on. A link works once: Apply and Discard remove the
+draft, and a second use finds none. Whether the person may decide is checked when they
+confirm, not when the mail was sent, so a link of somebody who left the role does nothing.
+Opening a link only shows a confirm page; mail scanners that open links decide nothing.
 
 Two ready workflows are in [`examples/`](examples): import
 `workflows-follow-the-organisation.json` and `approve-workflow-drafts.json`, create a data table
@@ -214,6 +224,8 @@ fields, edges, seen_at`, fill in **Settings** and the credentials, and give a st
 | Create Draft | Stores a proposal with `ok = true` as an inactive draft. Returns `draftId` and `contentHash`. | n8n API |
 | Apply Draft | Applies a draft given the approved hash. Optionally activates a new workflow. | n8n API |
 | Discard Draft | Deletes a draft; refuses any workflow that is not a draft. | n8n API |
+| Issue Approval Tokens | `approveToken` and `rejectToken` for one person, bound to `draftId` and `contentHash`, plus `tokenExpiresAt`. Keeps the input fields. | Approval Seal API |
+| Verify Approval Token | Returns `draftId`, `contentHash`, `approver`, `decision` and `expiresAt` of a valid token; fails on a changed, foreign or expired one. | Approval Seal API |
 
 ### Approval Seal (`approvalSeal`)
 
@@ -239,8 +251,8 @@ under the agent → *Context & Access*.
 | **MCP OAuth2** (n8n built-in) | Access to the roleALPHA MCP endpoint for one organisation. Used for agents (default source) and for every traversal. The `agent` view needs admin rights on the tenant. For **Connect As: Agent** it must be a roleALPHA function account (grant type Client Credentials) whose role has `agent:run` and that may run the agent ("May run these agents"). |
 | **roleALPHA Agent Keys API** | Optional, for the `Agent Keys` source. `baseUrl` of the data node, and `keys`: `{"<agent uuid>": "agt_…"}`, or a list of `{agentUuid, key, label}`. An agent key reads only its own agent, so it cannot traverse. |
 | **roleALPHA Webhook API** | One signing secret, a JSON list of secrets, or a map from agent UUID to secret. |
-| **n8n API** (n8n built-in) | API key and base URL (`https://<host>/api/v1`) of the n8n instance the Workflow Builder manages. |
-| **Approval Seal API** | `key` (sign and verify) and optionally `legacyKey` (verify v2 only). |
+| **n8n API** (n8n built-in) | API key and base URL of the n8n instance the Workflow Builder manages. When the nodes run in that instance, `http://localhost:5678/api/v1` works even if `/api` is closed to the outside. |
+| **Approval Seal API** | `key` (sign and verify seals and approval tokens) and optionally `legacyKey` (verify v2 seals only). |
 
 Agent keys and webhook secrets are issued in the roleALPHA interface and shown only once.
 Store them nowhere except in these credentials.
@@ -281,7 +293,8 @@ record_keys, event, run_id, attempts, progress, at`.
 - Settings are clamped to fixed bounds.
 - The Workflow Builder never activates or changes a workflow by itself. A proposal is an
   inactive draft; Apply needs the hash that was sent to the approver and a target that did not
-  change since. Approval runs through Check Approver, so the webhook needs a signed-in address.
+  change since. The approval link is a signed one-time token for one person and one decision;
+  Check Approver decides at use whether that person may still decide.
 - Duplicate runs are blocked by leases, and wake-ups are claimed before they fire.
 - No credentials are kept in wait, settings or cache rows. The share cache key holds no
   record content, and a cached answer is checked again like a fresh one.
