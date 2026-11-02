@@ -215,12 +215,44 @@ have to be created once by hand.
 4. **Fill in Settings** in both workflows: `endpointUrl` and `organisation` of roleALPHA,
    `governingStep`, and in the first one `n8nUrl`, `approvalUrl` (`<n8nUrl>/webhook/rolealpha-workflow-approval`)
    and `mailFrom`.
-5. **Give the governing step a deciding role** in roleALPHA (e.g. a step with the custom ID
-   `automation:workflow-changes`). Its holders get the approval e-mails; without one nobody may
-   approve, and every draft stays a draft.
+5. **Set up the governing step in roleALPHA**, as described in the next section. Without it
+   nobody may approve, and every draft stays a draft.
 6. **Activate** *Approve workflow drafts* first, then *Workflows follow the organisation*. The
    first run only fills the data table and reports nothing; changes are reported from the
    second run on.
+
+### The governing step in roleALPHA
+
+Who may approve a workflow change is not set in n8n but in roleALPHA, on one step. The
+workflows find it by its custom ID (`governingStep` in Settings) and ask roleALPHA for its
+deciding role on every mail and on every click.
+
+1. **Create the step.** Add a process entity (entity type *Value Creation*) with:
+
+   | Field | Value |
+   |---|---|
+   | Name | e.g. *Workflow-Änderungen freigeben* |
+   | Custom ID | `automation:workflow-changes`, exactly as in `governingStep` |
+   | Subtype | `gate` (a decision by a person) |
+   | Frequency | `event_driven` |
+   | Description | What is decided: drafts of the Workflow Builder, applied only after approval |
+   | Criteria | What the approver checks, e.g. the draft fits the change, uses only existing credentials, holds no names, addresses or IDs, touches no other workflows |
+
+2. **Name the deciding role.** Draw `DECIDES_ON` from the role that decides to the step
+   (source = role, target = step), e.g. from *IT-Administration*. Get Decider reads
+   `DECIDES_ON` first and falls back to `ACCOUNTABLE_FOR`; drawing both, from the same role,
+   is clearest. More than one deciding role is allowed.
+3. **Fill the role with people.** Each person who fills the role (`EXECUTES` from person to
+   role) needs an e-mail address in roleALPHA. Every one of them gets their own mail with
+   their own links; the first who confirms decides, and the others' links then do nothing.
+   Agents that fill the role get no mail and can never approve.
+4. **Approve the drafts in roleALPHA.** Writes through MCP are drafts; the step and its edges
+   count only after a person approves them there.
+
+Changing who approves later needs no change in n8n: give the role to someone else, or point
+`DECIDES_ON` at another role. The next mail goes to the new holders, and links of someone who
+no longer fills the role do nothing. A person who fills two deciding roles of the step gets
+one mail per role.
 
 ## Nodes
 
