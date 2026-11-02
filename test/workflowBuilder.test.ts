@@ -18,11 +18,14 @@ import {
 } from '../lib/workflows';
 import { RoleAlphaWorkflowBuilder } from '../nodes/RoleAlphaWorkflowBuilder/RoleAlphaWorkflowBuilder.node';
 import { FakeGraph } from './fixtures';
+import { issueToken, TOKEN_PATTERN, verifyToken } from '../lib/approvalToken';
+import { signSeal } from '../lib/seal';
 
 const STEP = 's2000000-0000-4000-8000-000000000001';
 const ROLE = 'r2000000-0000-4000-8000-000000000001';
 const AGENT = 'a2000000-0000-4000-8000-000000000001';
 const NOW = new Date('2026-11-02T08:00:00Z');
+const SEAL_KEY = 'k'.repeat(16) + '0123456789abcdef0123';
 
 const snap = (uuid: string, name: string, data: Record<string, unknown> = {}, edges: Array<[string, 'incoming' | 'outgoing', string]> = [], entityType = 'process') =>
 	snapshotOf({ uuid, name, entityType }, { name, customId: null, data }, edges.map(([type, direction, to]) => ({ type, direction, uuid: to, name: '', entityType: '' })));
@@ -260,7 +263,7 @@ function nodeCtx(params: Record<string, unknown>, opts: { tools?: Record<string,
 	const ctx: any = {
 		getInputData: () => [{ json: {} }],
 		getNodeParameter: (name: string, _i: number, fallback?: unknown) => (name in params ? params[name] : fallback),
-		getCredentials: async (type: string) => (type === 'n8nApi' ? { baseUrl: 'https://n8n.example.com/api/v1/', apiKey: 'k' } : {}),
+		getCredentials: async (type: string) => (type === 'n8nApi' ? { baseUrl: 'https://n8n.example.com/api/v1/', apiKey: 'k' } : type === 'approvalSealApi' ? { key: SEAL_KEY } : {}),
 		getNode: () => ({ name: 'test', type: 'test', typeVersion: 1, position: [0, 0], parameters: {} }),
 		continueOnFail: () => false,
 		getInputConnectionData: async () => ({
@@ -319,4 +322,56 @@ test('Propose asks the model again with the problems, then returns a checked pro
 	assert.equal(draft.json.contentHash, proposal.contentHash);
 	assert.ok(n8n.calls.includes(`PUT /workflows/${draft.json.draftId}/tags`));
 	assert.equal(n8n.store.get(String(draft.json.draftId))!.active, false);
+});
+
+// ---------------------------------------------------------------- approval tokens
+
+test('An approval token carries draft, hash, person and decision, and nothing else verifies', () => {
+	const input = { draftId: 'd1', contentHash: 'h1', approver: ' Anna@Example.com ', decision: 'approve' as const };
+	const { token, expiresAt } = issueToken(SEAL_KEY, input, { validHours: 2, now: NOW });
+	assert.match(token, TOKEN_PATTERN);
+	assert.equal(expiresAt, '2026-11-02T10:00:00.000Z');
+	const ok = verifyToken(SEAL_KEY, token, { now: NOW });
+	assert.equal(ok.valid, true);
+	assert.deepEqual(ok.claims, { draftId: 'd1', contentHash: 'h1', approver: 'anna@example.com', decision: 'approve', exp: Date.parse(expiresAt) / 1000 });
+
+	// A reject link turned into an approve link: the signature no longer fits.
+	const [prefix, body, sig] = issueToken(SEAL_KEY, { ...input, decision: 'reject' }, { now: NOW }).token.split('.');
+	const claims = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'));
+	const forged = `${prefix}.${Buffer.from(JSON.stringify({ ...claims, decision: 'approve' })).toString('base64url')}.${sig}`;
+	assert.equal(verifyToken(SEAL_KEY, forged, { now: NOW }).valid, false);
+	assert.equal(verifyToken('x'.repeat(40), token, { now: NOW }).valid, false, 'another key');
+	assert.match(verifyToken(SEAL_KEY, token, { now: new Date('2026-11-02T10:00:00Z') }).reason, /expired/);
+	assert.equal(verifyToken(SEAL_KEY, signSeal(SEAL_KEY, 'post', { a: 1 }, 'anna@example.com')).valid, false, 'a seal is no token');
+	assert.equal(verifyToken(SEAL_KEY, `${token}"><script>`, { now: NOW }).valid, false);
+	assert.throws(() => issueToken('short', input), /at least 32/);
+	assert.throws(() => issueToken(SEAL_KEY, { ...input, approver: 'nobody' }), /approver/);
+});
+
+test('The links of Issue Approval Tokens work once: Verify gives the claims, a second Apply finds no draft', async () => {
+	const n8n = fakeN8n([managedWf('w1')]);
+	const plan = checkPlan(planCtx(), newWorkflow([schedule, runner]));
+	const draft = await n8n.api.create(draftWorkflow(plan, change));
+	const { hash } = draftHash(draft);
+	const builder = new RoleAlphaWorkflowBuilder();
+
+	const issue = nodeCtx({ operation: 'issueTokens', draftId: draft.id, contentHash: hash, approver: 'anna@example.com', validHours: 24 }, {});
+	issue.ctx.getInputData = () => [{ json: { email: 'anna@example.com', name: 'Anna' } }];
+	const [[links]] = await builder.execute.call(issue.ctx);
+	const { approveToken, rejectToken, name } = links.json as any;
+	assert.equal(name, 'Anna', 'the input stays on the item');
+	assert.notEqual(approveToken, rejectToken);
+
+	const verify = async (token: string) => (await builder.execute.call(nodeCtx({ operation: 'verifyToken', token }, {}).ctx))[0][0].json as any;
+	const claims = await verify(approveToken);
+	assert.deepEqual([claims.draftId, claims.contentHash, claims.approver, claims.decision], [draft.id, hash, 'anna@example.com', 'approve']);
+	assert.equal((await verify(rejectToken)).decision, 'reject');
+	await assert.rejects(verify(approveToken.slice(0, -2) + 'AA'), /not valid/);
+
+	const apply = () => builder.execute.call(nodeCtx({ operation: 'applyDraft', draftId: claims.draftId, approvedHash: claims.contentHash }, { n8n }).ctx);
+	const [[applied]] = await apply();
+	assert.equal((applied.json as any).applied, true);
+	await assert.rejects(apply(), /no roleALPHA draft/);
+	const discard = () => builder.execute.call(nodeCtx({ operation: 'discardDraft', draftId: claims.draftId }, { n8n }).ctx);
+	await assert.rejects(discard(), /no roleALPHA draft/);
 });

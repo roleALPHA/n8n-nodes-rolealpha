@@ -11,7 +11,7 @@
         -420
       ],
       "parameters": {
-        "content": "## Workflows follow the organisation\nEvery 15 minutes the builder compares the roleALPHA graph with the snapshot table `rolealpha_snapshot` (columns: uuid, entity_type, name, custom_id, fingerprint, fields, edges, seen_at \u2014 all text).\n\nFor every new, changed or removed step, role or agent, the model proposes what that means for the n8n workflows. A usable proposal becomes an **inactive draft**, and every person filling the deciding role of the governing step gets an e-mail with links to approve or reject it (workflow *roleALPHA: Approve workflow drafts*).\n\nSet the values in **Settings** and the credentials (roleALPHA MCP OAuth2, n8n API, Anthropic, SMTP). The first run only stores the snapshot.",
+        "content": "## Workflows follow the organisation\nEvery 15 minutes the builder compares the roleALPHA graph with the snapshot table `rolealpha_snapshot` (columns: uuid, entity_type, name, custom_id, fingerprint, fields, edges, seen_at \u2014 all text).\n\nFor every new, changed or removed step, role or agent, the model proposes what that means for the n8n workflows. A usable proposal becomes an **inactive draft**, and every person filling the deciding role of the governing step gets an e-mail with links to approve or reject it (workflow *roleALPHA: Approve workflow drafts*).\n\nSet the values in **Settings** and the credentials (roleALPHA MCP OAuth2, n8n API, Approval Seal, Anthropic, SMTP). The links are signed one-time tokens: each is bound to the draft, its content, the person and the decision, and expires after 7 days. The first run only stores the snapshot.",
         "width": 620,
         "height": 340
       }
@@ -414,12 +414,35 @@
       }
     },
     {
+      "id": "bfa7a7e7-6e72-5d1d-aedf-6ca784e20481",
+      "name": "Approval links",
+      "type": "@rolealpha/n8n-nodes-rolealpha.roleAlphaWorkflowBuilder",
+      "typeVersion": 1,
+      "position": [
+        2440,
+        160
+      ],
+      "parameters": {
+        "operation": "issueTokens",
+        "draftId": "={{ $('Create draft').item.json.draftId }}",
+        "contentHash": "={{ $('Create draft').item.json.contentHash }}",
+        "approver": "={{ $json.email }}",
+        "validHours": 168
+      },
+      "credentials": {
+        "approvalSealApi": {
+          "id": "",
+          "name": "Approval Seal"
+        }
+      }
+    },
+    {
       "id": "cf563ccb-3559-5c00-ad9a-b9a048aaea27",
       "name": "Ask for approval",
       "type": "n8n-nodes-base.emailSend",
       "typeVersion": 2.1,
       "position": [
-        2440,
+        2660,
         160
       ],
       "parameters": {
@@ -428,7 +451,7 @@
         "toEmail": "={{ $json.email }}",
         "subject": "=Workflow change to approve: {{ $('Create draft').item.json.draftName }}",
         "emailFormat": "html",
-        "html": "=<p>{{ $('Create draft').item.json.entityName }} was {{ $('Create draft').item.json.change }} in roleALPHA. The model proposes to <b>{{ $('Create draft').item.json.action }}</b> a workflow:</p><blockquote>{{ $('Create draft').item.json.reason }}</blockquote>{{ $('Create draft').item.json.notes.length ? '<p>Before approving: ' + $('Create draft').item.json.notes.join('; ') + '</p>' : '' }}<p><a href=\"{{ $('Settings').first().json.n8nUrl }}/workflow/{{ $('Create draft').item.json.draftId }}\">Look at the draft</a></p><p><a href=\"{{ $('Settings').first().json.approvalUrl }}?draftId={{ $('Create draft').item.json.draftId }}&hash={{ $('Create draft').item.json.contentHash }}&decision=approve\">Approve</a> \u00b7 <a href=\"{{ $('Settings').first().json.approvalUrl }}?draftId={{ $('Create draft').item.json.draftId }}&decision=reject\">Reject</a></p><p>You get this because you fill {{ $('Deciding roles').item.json.name }}.</p>",
+        "html": "=<p>{{ $('Create draft').item.json.entityName }} was {{ $('Create draft').item.json.change }} in roleALPHA. The model proposes to <b>{{ $('Create draft').item.json.action }}</b> a workflow:</p><blockquote>{{ $('Create draft').item.json.reason }}</blockquote>{{ $('Create draft').item.json.notes.length ? '<p>Before approving: ' + $('Create draft').item.json.notes.join('; ') + '</p>' : '' }}<p><a href=\"{{ $('Settings').first().json.n8nUrl }}/workflow/{{ $('Create draft').item.json.draftId }}\">Look at the draft</a></p><p><a href=\"{{ $('Settings').first().json.approvalUrl }}?token={{ $json.approveToken }}\">Approve</a> \u00b7 <a href=\"{{ $('Settings').first().json.approvalUrl }}?token={{ $json.rejectToken }}\">Reject</a></p><p>The links are for you alone and work once, until {{ DateTime.fromISO($json.tokenExpiresAt).toFormat('yyyy-MM-dd HH:mm') }}. You get this because you fill {{ $('Deciding roles').item.json.name }}.</p>",
         "options": {
           "appendAttribution": false
         }
@@ -596,6 +619,17 @@
       ]
     },
     "Persons": {
+      "main": [
+        [
+          {
+            "node": "Approval links",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Approval links": {
       "main": [
         [
           {

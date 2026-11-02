@@ -20,10 +20,12 @@ import {
 	type N8nWorkflow,
 	type PlanCheck,
 } from '../../lib/workflows';
+import { issueToken, verifyToken } from '../../lib/approvalToken';
 
 const show = (operation: string[]) => ({ show: { operation } });
 const MCP_OPS = ['detectChanges', 'propose'];
 const N8N_OPS = ['listWorkflows', 'propose', 'createDraft', 'applyDraft', 'discardDraft'];
+const TOKEN_OPS = ['issueTokens', 'verifyToken'];
 
 const properties: INodeProperties[] = [
 	{
@@ -38,6 +40,8 @@ const properties: INodeProperties[] = [
 			{ name: 'Create Draft', value: 'createDraft', action: 'Create an inactive draft from a proposal', description: 'Stores a checked proposal as an inactive draft workflow that waits for approval' },
 			{ name: 'Apply Draft', value: 'applyDraft', action: 'Apply an approved draft', description: 'Creates, updates or deactivates the workflow; refuses if the draft or the target changed' },
 			{ name: 'Discard Draft', value: 'discardDraft', action: 'Discard a rejected draft', description: 'Deletes a draft; refuses anything that is not a draft' },
+			{ name: 'Issue Approval Tokens', value: 'issueTokens', action: 'Issue approve and reject links for one person', description: 'Signed one-time tokens bound to the draft, its hash, the person and the decision' },
+			{ name: 'Verify Approval Token', value: 'verifyToken', action: 'Verify the token of an approval link', description: 'Returns draft, hash, person and decision of a valid token; refuses changed or expired ones' },
 		],
 		default: 'detectChanges',
 	},
@@ -163,7 +167,43 @@ const properties: INodeProperties[] = [
 		type: 'string',
 		default: '',
 		required: true,
-		displayOptions: show(['applyDraft', 'discardDraft']),
+		displayOptions: show(['applyDraft', 'discardDraft', 'issueTokens']),
+	},
+	{
+		displayName: 'Content Hash',
+		name: 'contentHash',
+		type: 'string',
+		default: '={{ $json.contentHash }}',
+		required: true,
+		description: 'The contentHash from Create Draft; the token is valid only for exactly this content',
+		displayOptions: show(['issueTokens']),
+	},
+	{
+		displayName: 'Approver',
+		name: 'approver',
+		type: 'string',
+		default: '={{ $json.email }}',
+		required: true,
+		placeholder: 'name@example.com',
+		description: 'The person the links are for. Whether they may decide is checked again when they use the link.',
+		displayOptions: show(['issueTokens']),
+	},
+	{
+		displayName: 'Valid For (Hours)',
+		name: 'validHours',
+		type: 'number',
+		typeOptions: { minValue: 1, maxValue: 720 },
+		default: 168,
+		displayOptions: show(['issueTokens']),
+	},
+	{
+		displayName: 'Token',
+		name: 'token',
+		type: 'string',
+		default: '',
+		required: true,
+		description: 'The token from the approval link',
+		displayOptions: show(['verifyToken']),
 	},
 	{
 		displayName: 'Approved Hash',
@@ -171,7 +211,7 @@ const properties: INodeProperties[] = [
 		type: 'string',
 		default: '',
 		required: true,
-		description: 'The contentHash the approver saw and sealed. Verify the seal first with Approval Seal → Verify.',
+		description: 'The contentHash the approver saw: the contentHash of a verified approval token, or of a verified seal',
 		displayOptions: show(['applyDraft']),
 	},
 	{
@@ -276,6 +316,7 @@ export class RoleAlphaWorkflowBuilder implements INodeType {
 		credentials: [
 			{ name: 'mcpOAuth2Api', required: true, displayOptions: show(MCP_OPS) },
 			{ name: 'n8nApi', required: true, displayOptions: show(N8N_OPS) },
+			{ name: 'approvalSealApi', required: true, displayOptions: show(TOKEN_OPS) },
 		],
 		properties,
 	};
@@ -290,6 +331,7 @@ export class RoleAlphaWorkflowBuilder implements INodeType {
 		const getClient = (i: number) => (client ??= mcpClientFor(this, this.getNodeParameter('endpointUrl', i) as string));
 		const getGraph = (i: number) => (graph ??= new McpGraphSource(getClient(i), organisationAt(i)));
 		const api = N8N_OPS.includes(operation) ? await n8nApiFor(this) : undefined;
+		const sealKey = TOKEN_OPS.includes(operation) ? String((await this.getCredentials('approvalSealApi')).key ?? '') : '';
 
 		// The snapshot is one decision over all stored rows.
 		if (operation === 'detectChanges') {
@@ -391,6 +433,27 @@ export class RoleAlphaWorkflowBuilder implements INodeType {
 
 				if (operation === 'discardDraft') {
 					out.push({ json: await discardDraft(api!, String(this.getNodeParameter('draftId', i)).trim()), pairedItem: { item: i } });
+					continue;
+				}
+
+				if (operation === 'issueTokens') {
+					const input = {
+						draftId: String(this.getNodeParameter('draftId', i)),
+						contentHash: String(this.getNodeParameter('contentHash', i)),
+						approver: String(this.getNodeParameter('approver', i)),
+					};
+					const validHours = this.getNodeParameter('validHours', i, 168) as number;
+					const approve = issueToken(sealKey, { ...input, decision: 'approve' }, { validHours });
+					const reject = issueToken(sealKey, { ...input, decision: 'reject' }, { validHours });
+					out.push({ json: { ...items[i].json, approveToken: approve.token, rejectToken: reject.token, tokenExpiresAt: approve.expiresAt }, pairedItem: { item: i } });
+					continue;
+				}
+
+				if (operation === 'verifyToken') {
+					const check = verifyToken(sealKey, this.getNodeParameter('token', i, ''));
+					if (!check.valid || !check.claims) throw new NodeOperationError(this.getNode(), `Approval link not valid: ${check.reason}`, { itemIndex: i });
+					const { draftId, contentHash, approver, decision, exp } = check.claims;
+					out.push({ json: { draftId, contentHash, approver, decision, expiresAt: new Date(exp * 1000).toISOString() }, pairedItem: { item: i } });
 					continue;
 				}
 

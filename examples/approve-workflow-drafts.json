@@ -8,12 +8,12 @@
       "typeVersion": 1,
       "position": [
         -200,
-        -400
+        -460
       ],
       "parameters": {
-        "content": "## Approve workflow drafts\nThe links in the approval e-mail land here. **Put this webhook behind your single sign-on proxy** (e.g. oauth2-proxy): the proxy signs the person in and passes the address in `X-Auth-Request-Email`. Without it anybody holding the link could claim to be the approver.\n\n**Check Approver** then asks roleALPHA whether that person fills the deciding role of the governing step right now (fail-closed). Approve applies the draft only if it still has the hash that was sent out; reject deletes the draft.",
-        "width": 620,
-        "height": 300
+        "content": "## Approve workflow drafts\nThe links in the approval e-mail land here. A link carries a **signed one-time token**: it names the draft, the hash of its content, the person and the decision, and it expires. Nobody can change it or make one without the Approval Seal key, so the webhook can be public.\n\n**Opening** the link only shows a page with a button, so mail scanners that open links decide nothing. **The button** sends the token back; then roleALPHA is asked whether that person fills the deciding role of the governing step *right now* (fail-closed). Approve applies the draft only with exactly the content that was sent out, reject deletes it. Either way the draft is gone, so a link works once.",
+        "width": 640,
+        "height": 340
       }
     },
     {
@@ -23,7 +23,7 @@
       "typeVersion": 2.1,
       "position": [
         0,
-        0
+        -200
       ],
       "parameters": {
         "httpMethod": "GET",
@@ -34,13 +34,130 @@
       "webhookId": "0d4378cb-52a7-5f9e-8938-f7e28db3281c"
     },
     {
+      "id": "daceb551-85b6-5bbb-a37b-97819508d0d3",
+      "name": "Read link",
+      "type": "@rolealpha/n8n-nodes-rolealpha.roleAlphaWorkflowBuilder",
+      "typeVersion": 1,
+      "position": [
+        220,
+        -200
+      ],
+      "parameters": {
+        "operation": "verifyToken",
+        "token": "={{ $json.query.token ?? '' }}"
+      },
+      "credentials": {
+        "approvalSealApi": {
+          "id": "",
+          "name": "Approval Seal"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "1bcb7f30-91c3-511a-8c3a-1f417cf9023d",
+      "name": "Confirm page",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        460,
+        -280
+      ],
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "=<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'><title>Workflow draft</title><body style='font-family:system-ui;max-width:32rem;margin:3rem auto;padding:0 1rem'><h1>{{ $json.decision === 'approve' ? 'Approve' : 'Reject' }} workflow draft {{ $json.draftId }}?</h1><p>For {{ $json.approver }}. Whether you may decide is checked when you confirm.</p><form method=post><input type=hidden name=token value='{{ $('Approval link').item.json.query.token }}'><button style='font-size:1.1rem;padding:.6rem 1.2rem'>{{ $json.decision === 'approve' ? 'Approve' : 'Reject' }}</button></form>",
+        "options": {
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "text/html; charset=utf-8"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "7167c498-167d-5849-b4a0-82270a5b1f27",
+      "name": "Link not valid",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        460,
+        -100
+      ],
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.error }}",
+        "options": {
+          "responseCode": 400
+        }
+      }
+    },
+    {
+      "id": "5308049d-2c0d-5ba5-ab04-da5493f60424",
+      "name": "Confirmation",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        0,
+        200
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "rolealpha-workflow-approval",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "webhookId": "71c131dc-5a1f-528c-96fa-3369a6d64163"
+    },
+    {
+      "id": "245584f9-4867-5d47-b2a2-43efe8fc5824",
+      "name": "Check link",
+      "type": "@rolealpha/n8n-nodes-rolealpha.roleAlphaWorkflowBuilder",
+      "typeVersion": 1,
+      "position": [
+        220,
+        200
+      ],
+      "parameters": {
+        "operation": "verifyToken",
+        "token": "={{ $json.body.token ?? '' }}"
+      },
+      "credentials": {
+        "approvalSealApi": {
+          "id": "",
+          "name": "Approval Seal"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "ad0dba85-8793-5de7-a6a7-28c7531bb24a",
+      "name": "Not valid",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        460,
+        380
+      ],
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.error }}",
+        "options": {
+          "responseCode": 400
+        }
+      }
+    },
+    {
       "id": "c74beeb7-1723-56f3-b2e2-f9f50d47f8b7",
       "name": "Settings",
       "type": "n8n-nodes-base.set",
       "typeVersion": 3.4,
       "position": [
-        220,
-        0
+        460,
+        200
       ],
       "parameters": {
         "mode": "manual",
@@ -63,12 +180,6 @@
               "name": "governingStep",
               "value": "automation:workflow-changes",
               "type": "string"
-            },
-            {
-              "id": "091d89dd-531c-5199-96e9-5491ead2244d",
-              "name": "identityHeader",
-              "value": "x-auth-request-email",
-              "type": "string"
             }
           ]
         },
@@ -81,8 +192,8 @@
       "type": "@rolealpha/n8n-nodes-rolealpha.roleAlpha",
       "typeVersion": 1,
       "position": [
-        440,
-        0
+        680,
+        200
       ],
       "parameters": {
         "resource": "responsibility",
@@ -90,7 +201,7 @@
         "endpointUrl": "={{ $('Settings').first().json.endpointUrl }}",
         "organisation": "={{ $('Settings').first().json.organisation }}",
         "step": "={{ $('Settings').first().json.governingStep }}",
-        "actor": "={{ $('Approval link').item.json.headers[$('Settings').first().json.identityHeader] ?? '' }}",
+        "actor": "={{ $('Check link').item.json.approver }}",
         "responsibilityOptions": {}
       },
       "credentials": {
@@ -106,8 +217,8 @@
       "type": "n8n-nodes-base.if",
       "typeVersion": 2.2,
       "position": [
-        660,
-        0
+        900,
+        200
       ],
       "parameters": {
         "conditions": {
@@ -140,8 +251,8 @@
       "type": "n8n-nodes-base.if",
       "typeVersion": 2.2,
       "position": [
-        880,
-        -100
+        1120,
+        100
       ],
       "parameters": {
         "conditions": {
@@ -154,7 +265,7 @@
           "conditions": [
             {
               "id": "989fb47b-7d43-55f4-a4f8-acf2cc03915a",
-              "leftValue": "={{ $('Approval link').item.json.query.decision }}",
+              "leftValue": "={{ $('Check link').item.json.decision }}",
               "rightValue": "approve",
               "operator": {
                 "type": "string",
@@ -173,13 +284,13 @@
       "type": "@rolealpha/n8n-nodes-rolealpha.roleAlphaWorkflowBuilder",
       "typeVersion": 1,
       "position": [
-        1100,
-        -200
+        1340,
+        0
       ],
       "parameters": {
         "operation": "applyDraft",
-        "draftId": "={{ $('Approval link').item.json.query.draftId }}",
-        "approvedHash": "={{ $('Approval link').item.json.query.hash }}",
+        "draftId": "={{ $('Check link').item.json.draftId }}",
+        "approvedHash": "={{ $('Check link').item.json.contentHash }}",
         "activate": false
       },
       "credentials": {
@@ -196,12 +307,12 @@
       "type": "@rolealpha/n8n-nodes-rolealpha.roleAlphaWorkflowBuilder",
       "typeVersion": 1,
       "position": [
-        1100,
-        0
+        1340,
+        200
       ],
       "parameters": {
         "operation": "discardDraft",
-        "draftId": "={{ $('Approval link').item.json.query.draftId }}"
+        "draftId": "={{ $('Check link').item.json.draftId }}"
       },
       "credentials": {
         "n8nApi": {
@@ -217,8 +328,8 @@
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.5,
       "position": [
-        1320,
-        -100
+        1560,
+        100
       ],
       "parameters": {
         "respondWith": "text",
@@ -232,8 +343,8 @@
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.5,
       "position": [
-        880,
-        160
+        1120,
+        360
       ],
       "parameters": {
         "respondWith": "text",
@@ -249,7 +360,54 @@
       "main": [
         [
           {
+            "node": "Read link",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read link": {
+      "main": [
+        [
+          {
+            "node": "Confirm page",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Link not valid",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Confirmation": {
+      "main": [
+        [
+          {
+            "node": "Check link",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check link": {
+      "main": [
+        [
+          {
             "node": "Settings",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Not valid",
             "type": "main",
             "index": 0
           }
