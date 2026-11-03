@@ -87,7 +87,9 @@ test('McpClient repeats calls turned away for load, and empty replies of reads o
 	const budget = new McpClient(async () => ({ status: 429, headers: {}, body: '{"error":"agent_budget_erschoepft"}' }), 'test', async () => assert.fail('no wait'));
 	await assert.rejects(budget.callTool('get_x', {}), /HTTP 429/);
 	assert.equal(retryDelay(undefined, 3, () => 0), 8000);
-	assert.equal(retryDelay({ status: 429, headers: { 'retry-after': '120' }, body: '' }, 0, () => 0), 30000);
+	assert.equal(retryDelay({ status: 429, headers: { 'retry-after': '120' }, body: '' }, 0, () => 0), 61000);
+	assert.equal(retryDelay({ status: 429, headers: { 'RateLimit-Reset': '42' }, body: '' }, 0, () => 0), 42000);
+	assert.equal(retryDelay({ status: 429, headers: { ratelimit: 'limit=120, remaining=0, reset=17' }, body: '' }, 0, () => 0), 17000);
 });
 
 test('McpClient surfaces HTTP errors', async () => {

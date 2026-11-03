@@ -105,12 +105,26 @@ const sleepFor: Sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)
 
 /** Repeats of a call the server turned away for load (429, 503) or answered empty. */
 const RETRIES = 4;
-const MAX_WAIT_MS = 30_000;
+/** One window of the roleALPHA limiter is a minute; waiting longer never helps. */
+const MAX_WAIT_MS = 61_000;
 
-/** Wait before repeat `attempt` (0-based): Retry-After if the server sent one, else 1, 2, 4, 8 s plus jitter. */
+/** Seconds the server asks to wait: Retry-After, RateLimit-Reset, or reset= in a RateLimit header. */
+function waitSeconds(reply: HttpReply): number {
+	const plain = (name: string) => {
+		const v = header(reply.headers, name)?.trim();
+		return v !== undefined && /^\d+(\.\d+)?$/.test(v) ? Number(v) : NaN;
+	};
+	for (const name of ['retry-after', 'ratelimit-reset']) {
+		const s = plain(name);
+		if (Number.isFinite(s)) return s;
+	}
+	const m = /(?:^|[;,\s])reset=(\d+(?:\.\d+)?)/i.exec(header(reply.headers, 'ratelimit') ?? '');
+	return m ? Number(m[1]) : NaN;
+}
+
+/** Wait before repeat `attempt` (0-based): what the server asked for, else 1, 2, 4, 8 s, plus jitter. */
 export function retryDelay(reply: HttpReply | undefined, attempt: number, random: () => number = Math.random): number {
-	const after = reply ? header(reply.headers, 'retry-after') : undefined;
-	const seconds = after !== undefined && /^\d+(\.\d+)?$/.test(after.trim()) ? Number(after) : NaN;
+	const seconds = reply ? waitSeconds(reply) : NaN;
 	const base = Number.isFinite(seconds) ? seconds * 1000 : 1000 * 2 ** attempt;
 	return Math.min(MAX_WAIT_MS, Math.round(base + random() * 500));
 }

@@ -1,7 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { detectChanges, PENDING, readSnapshots, snapshotOf, toRow, type EntityChange } from '../lib/changes';
+import { boundEntities, detectChanges, normalizeFeedRows, summarizeFeed, type EntityChange, type FeedRow } from '../lib/changes';
+import { McpClient } from '../lib/mcp';
 import {
+	affectedWorkflows,
 	applyDraft,
 	checkPlan,
 	contentHash,
@@ -17,7 +19,6 @@ import {
 	type PlanContext,
 } from '../lib/workflows';
 import { RoleAlphaWorkflowBuilder } from '../nodes/RoleAlphaWorkflowBuilder/RoleAlphaWorkflowBuilder.node';
-import { FakeGraph } from './fixtures';
 import { issueToken, TOKEN_PATTERN, verifyToken } from '../lib/approvalToken';
 import { signSeal } from '../lib/seal';
 
@@ -27,96 +28,126 @@ const AGENT = 'a2000000-0000-4000-8000-000000000001';
 const NOW = new Date('2026-11-02T08:00:00Z');
 const SEAL_KEY = 'k'.repeat(16) + '0123456789abcdef0123';
 
-const snap = (uuid: string, name: string, data: Record<string, unknown> = {}, edges: Array<[string, 'incoming' | 'outgoing', string]> = [], entityType = 'process') =>
-	snapshotOf({ uuid, name, entityType }, { name, customId: null, data }, edges.map(([type, direction, to]) => ({ type, direction, uuid: to, name: '', entityType: '' })));
+const NEXT = 's2000000-0000-4000-8000-000000000002';
+const GONE = 's2000000-0000-4000-8000-000000000009';
+
+const row = (entityUuid: string, change: FeedRow['change'], extra: Partial<FeedRow> = {}): FeedRow => ({ entityUuid, entityType: 'process', changedAt: '2026-11-03T07:00:00.000Z', change, ...extra });
+const via = (relationshipType: string, otherEntityUuid: string | null, action: 'added' | 'changed' | 'removed' = 'added') => ({ via: { relationshipId: 1, relationshipType, otherEntityUuid, role: 'to' as const, action } });
+
+/** A fake list_changes: pages of rows behind numbered cursors (page 0 is history), and entities that exist. */
+function fakeFeed(pages: FeedRow[][], exists: Record<string, 'yes' | 'no' | 'busy'> = {}) {
+	const calls: Array<Record<string, unknown>> = [];
+	const tools: Record<string, (a: any) => unknown> = {
+		list_changes: (a: any) => {
+			calls.push(a);
+			// Like roleALPHA: `since` = now gives no history, only the cursor behind page 0.
+			if (!a.cursor) return { changes: [], nextCursor: 'c1', hasMore: false };
+			const at = Number(String(a.cursor).slice(1));
+			return { changes: pages[at] ?? [], nextCursor: `c${Math.min(at + 1, pages.length)}`, hasMore: at + 1 < pages.length };
+		},
+		get_entity_details: (a: any) => {
+			calls.push({ details: a.entityUuid });
+			const state = exists[a.entityUuid] ?? 'yes';
+			if (state === 'no') return { error: 'Entity not found' };
+			if (state === 'busy') throw new Error('MCP tools/call failed with HTTP 429');
+			return { uuid: a.entityUuid, name: 'Step', entityTypeName: 'Value Creation' };
+		},
+	};
+	const client = new McpClient(async (body: any) => {
+		if (body.id === undefined) return { status: 202, headers: {}, body: '' };
+		if (body.method !== 'tools/call') return { status: 200, headers: {}, body: JSON.stringify({ jsonrpc: '2.0', id: body.id, result: {} }) };
+		try {
+			const result = { content: [{ type: 'text', text: JSON.stringify(tools[body.params.name](body.params.arguments)) }] };
+			return { status: 200, headers: {}, body: JSON.stringify({ jsonrpc: '2.0', id: body.id, result }) };
+		} catch (e) {
+			return { status: 200, headers: {}, body: JSON.stringify({ jsonrpc: '2.0', id: body.id, result: { isError: true, content: [{ type: 'text', text: (e as Error).message }] } }) };
+		}
+	}, 'test', async () => {});
+	return { client, calls, tools };
+}
 
 // ---------------------------------------------------------------- detection
 
-test('The first run stores the snapshot and reports nothing', () => {
-	const res = detectChanges([], [snap(STEP, 'Review')], { complete: true, types: ['process'], now: NOW });
-	assert.equal(res.baseline, true);
+test('The first run starts now, reports nothing from before and checks the bound entities', async () => {
+	const { client, calls } = fakeFeed([[]]);
+	const res = await detectChanges(client, 'org', {}, { bound: new Map([[STEP, ['w1']]]), watchTypes: ['process'], now: NOW });
+	assert.equal(res.started, true);
+	assert.deepEqual(calls[0], { organisation: 'org', limit: 500, since: NOW.toISOString() });
 	assert.deepEqual(res.changes, []);
-	assert.equal(res.upsert.length, 1);
-	const reported = detectChanges([], [snap(STEP, 'Review')], { complete: true, types: ['process'], reportBaseline: true });
-	assert.equal(reported.changes[0].change, 'created');
+	assert.equal(res.checked, 1);
+	assert.deepEqual(res.state, { cursor: 'c1' });
 });
 
-test('Created, changed and removed entities are reported with what changed', () => {
-	const OLD = 's2000000-0000-4000-8000-000000000009';
-	const previous = [toRow(snap(STEP, 'Review', { status: 'active', description: 'a' }, [['RESPONSIBLE_FOR', 'incoming', ROLE]]), 'x'), toRow(snap(OLD, 'Gone'), 'x')];
-	const NEW = 's2000000-0000-4000-8000-000000000002';
-	const current = [snap(STEP, 'Review 2', { status: 'active', description: 'b' }, [['RESPONSIBLE_FOR', 'incoming', AGENT]]), snap(NEW, 'Publish')];
-	const res = detectChanges(previous, current, { complete: true, types: ['process'], now: NOW });
-	const by = Object.fromEntries(res.changes.map((c) => [c.uuid, c]));
-	assert.equal(by[NEW].change, 'created');
-	assert.equal(by[STEP].change, 'changed');
-	assert.equal(by[STEP].previousName, 'Review');
-	assert.deepEqual(by[STEP].changedFields, ['name', 'description']);
-	assert.deepEqual(by[STEP].edgesAdded, [`RESPONSIBLE_FOR<${AGENT}`]);
-	assert.deepEqual(by[STEP].edgesRemoved, [`RESPONSIBLE_FOR<${ROLE}`]);
-	assert.equal(by[OLD].change, 'removed');
-	assert.deepEqual(res.remove, [OLD]);
-	assert.equal(res.upsert.length, 2);
-});
-
-test('An unchanged entity and volatile attributes report nothing', () => {
-	const previous = [toRow(snap(STEP, 'Review', { status: 'active', updatedAt: '1' }), 'x')];
-	const res = detectChanges(previous, [snap(STEP, 'Review', { status: 'active', updatedAt: '2' })], { complete: true, types: ['process'] });
-	assert.deepEqual(res.changes, []);
-	assert.deepEqual(res.upsert, []);
-});
-
-test('An unreadable entity is neither changed nor removed, and rows of other types stay', async () => {
-	const graph = new FakeGraph({ [STEP]: { name: 'Review', type: 'Value Creation' } }, [], new Set([STEP]));
-	const read = await readSnapshots(graph, [{ uuid: STEP, name: 'Review', entityType: 'process' }], 2, { sleep: async () => {} });
-	assert.equal(read.unreadable.length, 1);
-	const previous = [toRow(snap(STEP, 'Review'), 'x'), toRow(snap(ROLE, 'Copy', {}, [], 'role'), 'x')];
-	const res = detectChanges(previous, read.snapshots, { complete: true, types: ['process'], unreadable: read.unreadable });
-	assert.deepEqual(res.changes, []);
-	assert.deepEqual(res.remove, []);
-	const partial = detectChanges(previous, [], { complete: false, types: ['process', 'role'] });
-	assert.deepEqual(partial.remove, [], 'without the complete index nothing counts as removed');
-});
-
-test('Entities the server turned away are read again one by one after a pause', async () => {
-	let calls = 0;
-	const busy = new Set([STEP, ROLE]);
-	const src: any = {
-		details: async (uuid: string) => {
-			calls++;
-			if (busy.delete(uuid)) throw new Error('MCP tools/call failed with HTTP 429');
-			return { name: uuid === STEP ? 'Review' : 'Copy', customId: null, data: {} };
-		},
-		relationships: async () => [],
-	};
-	const pauses: number[] = [];
-	const read = await readSnapshots(src, [{ uuid: STEP, name: 'Review', entityType: 'process' }, { uuid: ROLE, name: 'Copy', entityType: 'role' }, { uuid: AGENT, name: 'Bot', entityType: 'agent' }], 2, { pauseMs: 5, sleep: async (ms) => void pauses.push(ms) });
-	assert.deepEqual(read.unreadable, []);
-	assert.equal(read.snapshots.length, 3);
-	assert.deepEqual(pauses, [5]);
-	assert.equal(calls, 5);
-});
-
-test('An entity unreadable in the first run is taken in silently later; a new one unreadable later is reported when read', () => {
-	const unreadable = [{ uuid: ROLE, name: 'Copy', entityType: 'role', error: '429' }];
-	const first = detectChanges([], [snap(STEP, 'Review')], { complete: true, types: ['process', 'role'], unreadable, now: NOW });
-	assert.equal(first.baseline, true);
-	assert.deepEqual(first.upsert.map((r) => [r.uuid, r.entity_type, r.fingerprint === PENDING]), [[STEP, 'process', false], [ROLE, 'role', true]]);
-	const second = detectChanges(first.upsert, [snap(STEP, 'Review'), snap(ROLE, 'Copy', {}, [], 'role')], { complete: true, types: ['process', 'role'] });
-	assert.deepEqual(second.changes, [], 'its first snapshot is no change');
-	assert.deepEqual(second.upsert.map((r) => r.uuid), [ROLE]);
-	const later = detectChanges(second.upsert.concat(first.upsert.filter((r) => r.uuid === STEP)), [snap(STEP, 'Review'), snap(ROLE, 'Copy', {}, [], 'role')], {
-		complete: true, types: ['process', 'role', 'agent'], unreadable: [{ uuid: AGENT, name: 'Bot', entityType: 'agent', error: '429' }],
+test('Rows are merged per entity; own writes, runtime relationships and unwatched types are left out', () => {
+	const rows = normalizeFeedRows({
+		changes: [
+			row(STEP, 'updated'),
+			row(STEP, 'relationship', via('DEPENDS_ON', NEXT)),
+			row(STEP, 'relationship', via('DEPENDS_ON', NEXT)),
+			row(STEP, 'relationship', via('DECIDES_ON', ROLE)),
+			row(NEXT, 'created', { ownChange: true }),
+			row(ROLE, 'updated', { entityType: 'role' }),
+			row(AGENT, 'updated', { entityType: 'agent' }),
+			{ entityUuid: '', change: 'updated' },
+		],
 	});
-	assert.deepEqual(later.upsert, [], 'no pending row outside the first run');
-	assert.deepEqual(later.changes, []);
-	const read = detectChanges(second.upsert.concat(first.upsert.filter((r) => r.uuid === STEP)), [snap(STEP, 'Review'), snap(ROLE, 'Copy', {}, [], 'role'), snap(AGENT, 'Bot', {}, [], 'agent')], { complete: true, types: ['process', 'role', 'agent'] });
-	assert.deepEqual(read.changes.map((c) => [c.change, c.uuid]), [['created', AGENT]]);
+	const res = summarizeFeed(rows, { bound: new Map([[AGENT, ['w9']]]), watchTypes: ['process'], skipOwn: true });
+	assert.deepEqual(res.skipped, { own: 1, runtime: 1, unwatched: 1 });
+	const withOwn = summarizeFeed(rows, { bound: new Map(), watchTypes: ['process'] });
+	assert.ok(withOwn.changes.some((c) => c.uuid === NEXT), 'own changes stay unless asked to skip them');
+	const by = Object.fromEntries(res.changes.map((c) => [c.uuid, c]));
+	assert.deepEqual(Object.keys(by).sort(), [AGENT, STEP].sort());
+	assert.equal(by[STEP].change, 'changed');
+	assert.deepEqual(by[STEP].relationships, [{ type: 'DEPENDS_ON', action: 'added', otherUuid: NEXT, end: 'to' }]);
+	assert.deepEqual(by[AGENT].workflows, ['w9'], 'a bound entity counts whatever its type');
+	assert.equal(res.deletionSeen, false);
+});
+
+test('Later runs go on from the cursor, page by page; a new step is created', async () => {
+	const { client, calls } = fakeFeed([[row(STEP, 'updated')], [row(NEXT, 'created'), row(NEXT, 'relationship', via('DEPENDS_ON', STEP))]]);
+	const res = await detectChanges(client, 'org', { cursor: 'c0' }, { bound: new Map(), watchTypes: ['process'] });
+	assert.equal(res.started, false);
+	assert.deepEqual(calls.map((c) => c.cursor), ['c0', 'c1']);
+	assert.deepEqual(res.changes.map((c) => [c.change, c.uuid]), [['changed', STEP], ['created', NEXT]]);
+	assert.equal(res.checked, 0, 'no deletion seen, nothing to check');
+	assert.deepEqual([res.cursor, res.hasMore], ['c2', false]);
+	const capped = await fakeFeed([[], [], []]).client;
+	const part = await detectChanges(capped, 'org', { cursor: 'c0' }, { bound: new Map(), watchTypes: ['process'], maxPages: 2 });
+	assert.deepEqual([part.cursor, part.hasMore], ['c2', true], 'the rest waits for the next run');
+});
+
+test('A lost relationship end checks the bound entities; only "not found" counts as removed', async () => {
+	const lost = row(NEXT, 'relationship', via('DECIDES_ON', null, 'removed'));
+	const { client } = fakeFeed([[lost]], { [GONE]: 'no', [STEP]: 'busy' });
+	const res = await detectChanges(client, 'org', { cursor: 'c0' }, { bound: new Map([[GONE, ['w1']], [STEP, ['w2']], [ROLE, ['w2']]]), watchTypes: ['process'] });
+	assert.equal(res.checked, 3);
+	assert.deepEqual(res.changes.map((c) => [c.change, c.uuid, c.workflows]), [['removed', GONE, ['w1']]], 'the runtime row itself does not count');
+	assert.deepEqual(res.unreadable.map((u) => u.uuid), [STEP]);
+	assert.deepEqual(res.state, { cursor: 'c1', recheck: true });
+	const again = await detectChanges(fakeFeed([[], []]).client, 'org', { cursor: 'c1', recheck: true }, { bound: new Map([[STEP, ['w2']]]), watchTypes: ['process'] });
+	assert.deepEqual([again.checked, again.state.recheck], [1, undefined], 'checked again and cleared');
+});
+
+test('A failed read keeps the cursor where it was', async () => {
+	const { client, tools } = fakeFeed([[]]);
+	tools.list_changes = () => {
+		throw new Error('list_changes: Für diese Organisation ist kein Modul für die KI freigegeben');
+	};
+	await assert.rejects(detectChanges(client, 'org', { cursor: 'c7' }, { bound: new Map(), watchTypes: ['process'] }), /kein Modul/);
+});
+
+test('Bound entities come from managed workflows, drafts left out', () => {
+	const bound = boundEntities([
+		{ id: 'w1', entities: [STEP.toUpperCase()], isDraft: false },
+		{ id: 'w2', entities: [STEP, ROLE], isDraft: false },
+		{ id: 'd1', entities: [AGENT], isDraft: true },
+	]);
+	assert.deepEqual([...bound.entries()], [[STEP, ['w1', 'w2']], [ROLE, ['w2']]]);
 });
 
 // ---------------------------------------------------------------- the check
 
-const change: EntityChange = { change: 'created', uuid: STEP, name: 'Publish', entityType: 'process', customId: 'mk:publish', previousName: null, changedFields: [], edgesAdded: [], edgesRemoved: [] };
+const change: EntityChange = { change: 'created', uuid: STEP, name: 'Publish', entityType: 'process', customId: 'mk:publish', changedAt: null, relationships: [], workflows: [] };
 
 const managedWf = (id: string, extra: Partial<N8nWorkflow> = {}): N8nWorkflow => ({
 	id,
@@ -294,9 +325,11 @@ test('A deactivation draft deactivates the target; discard refuses anything but 
 
 // ---------------------------------------------------------------- node
 
-function nodeCtx(params: Record<string, unknown>, opts: { tools?: Record<string, (args: any) => unknown>; n8n?: ReturnType<typeof fakeN8n>; answers?: string[] }) {
+function nodeCtx(params: Record<string, unknown>, opts: { tools?: Record<string, (args: any) => unknown>; n8n?: ReturnType<typeof fakeN8n>; answers?: string[]; staticData?: Record<string, unknown> }) {
 	const prompts: unknown[] = [];
+	const staticData = opts.staticData ?? {};
 	const ctx: any = {
+		getWorkflowStaticData: () => staticData,
 		getInputData: () => [{ json: {} }],
 		getNodeParameter: (name: string, _i: number, fallback?: unknown) => (name in params ? params[name] : fallback),
 		getCredentials: async (type: string) => (type === 'n8nApi' ? { baseUrl: 'https://n8n.example.com/api/v1/', apiKey: 'k' } : type === 'approvalSealApi' ? { key: SEAL_KEY } : {}),
@@ -325,18 +358,46 @@ function nodeCtx(params: Record<string, unknown>, opts: { tools?: Record<string,
 }
 
 const graphTools = {
-	list_entities: (a: any) => ({ entities: a.entityType === 'process' ? [{ uuid: STEP, name: 'Publish', entityType: 'process' }] : [], hasMore: false }),
 	get_entity_details: (a: any) => ({ uuid: a.entityUuid, name: 'Publish', customerId: 'mk:publish', entityTypeName: 'Value Creation', descJsonb: { status: 'active' } }),
 	get_entity_relationships: () => ({ relationships: [{ relationType: 'RESPONSIBLE_FOR', direction: 'incoming', connectedEntityUuid: ROLE, connectedEntityName: 'Copy', connectedEntityType: 'Roles' }] }),
 };
 
-test('Detect Changes reads the index and reports a new step against stored rows', async () => {
-	const stored = [toRow(snap(ROLE, 'Copy', {}, [], 'process'), 'x')];
-	const { ctx } = nodeCtx({ operation: 'detectChanges', endpointUrl: 'https://ra/mcp', organisation: 'org', entityTypes: ['process', 'role'], snapshotRows: JSON.stringify(stored), detectOptions: {} }, { tools: graphTools });
-	const [[item]] = await new RoleAlphaWorkflowBuilder().execute.call(ctx);
+test('Detect Changes keeps its cursor in the workflow and reports changes of bound and watched entities', async () => {
+	const n8n = fakeN8n([managedWf('w1')]);
+	const feed = fakeFeed([[], [row(ROLE, 'updated', { entityType: 'role' }), row(NEXT, 'created'), row(ROLE, 'relationship', { entityType: 'role', ...via('EXECUTES', AGENT) })]]);
+	const staticData: Record<string, unknown> = {};
+	const params = { operation: 'detectChanges', endpointUrl: 'https://ra/mcp', organisation: 'org', entityTypes: ['process'], detectOptions: {} };
+	const first = await new RoleAlphaWorkflowBuilder().execute.call(nodeCtx(params, { tools: feed.tools, n8n, staticData }).ctx);
+	assert.equal((first[0][0].json as any).started, true);
+	assert.deepEqual(staticData, { cursor: 'c1' });
+	const [[item]] = await new RoleAlphaWorkflowBuilder().execute.call(nodeCtx(params, { tools: feed.tools, n8n, staticData }).ctx);
 	const res = item.json as any;
-	assert.equal(res.baseline, false);
-	assert.deepEqual(res.changes.map((c: any) => [c.change, c.uuid]), [['created', STEP], ['removed', ROLE]]);
+	assert.deepEqual(res.changes.map((c: any) => [c.change, c.uuid, c.workflows]), [['changed', ROLE, ['w1']], ['created', NEXT, []]]);
+	assert.deepEqual(res.skipped, { own: 0, runtime: 1, unwatched: 0 });
+	assert.equal(res.bound, 1);
+	assert.equal(res.state, undefined);
+	assert.deepEqual(staticData, { cursor: 'c2' });
+});
+
+test('A change to a neighbouring step updates the workflow without binding the neighbour to it', async () => {
+	const wf = managedWf('w1', { nodes: [...managedWf('w1').nodes.slice(0, 2), markerNode({ managed: true, entities: [STEP] })] });
+	const { api, store } = fakeN8n([wf]);
+	const neighbour: EntityChange = { ...change, change: 'changed', uuid: NEXT, relationships: [] };
+	const entity = { step: { uuid: NEXT, predecessors: [{ uuid: STEP, name: 'Review' }], successors: [], parents: [], children: [] } };
+	const m = summarizeWorkflows([wf]);
+	const affected = affectedWorkflows(neighbour, entity, m.workflows);
+	assert.deepEqual(affected, [{ workflowId: 'w1', name: 'Event router', as: 'neighbour' }]);
+	const ctx: PlanContext = { change: neighbour, entity, workflows: m.workflows, affected, credentials: m.credentials, nodeTypes: DEFAULT_NODE_TYPES };
+	const target = await api.get('w1');
+	const plan = checkPlan(ctx, { action: 'update', reason: 'Hand over to the new custom ID', targetWorkflowId: 'w1', workflow: { name: 'Event router', nodes: target.nodes.slice(0, 2), connections: {} } }, target);
+	assert.equal(plan.ok, true, plan.problems.join('; '));
+	assert.equal(plan.bindEntity, false);
+	const draft = await api.create(draftWorkflow(plan, neighbour, target));
+	assert.deepEqual(readBinding(draft)?.entities, [STEP]);
+	await applyDraft(api, draft.id!, draftHash(draft).hash);
+	assert.deepEqual(readBinding(store.get('w1')!)?.entities, [STEP]);
+	const bound = affectedWorkflows({ ...neighbour, uuid: STEP }, null, m.workflows);
+	assert.deepEqual(bound.map((a) => a.as), ['bound']);
 });
 
 test('Propose asks the model again with the problems, then returns a checked proposal; Create Draft stores it', async () => {

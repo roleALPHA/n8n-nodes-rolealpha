@@ -45,8 +45,8 @@ next run follows. You don't edit code and you don't republish anything.
 - **Teams of agents on one step.** Several roles share a step. Each agent does its own part,
   waits for what it needs and is woken when it arrives. Agents that hang are escalated to
   the role that leads their circle.
-- **Workflows that follow the organisation.** When a step, role or agent is created, changed
-  or removed in roleALPHA, a model proposes what that means for the n8n workflows. The
+- **Workflows that follow the organisation.** When a step is created or changed in roleALPHA,
+  or an entity a workflow is bound to changes or is removed, a model proposes what that means for the n8n workflows. The
   proposal becomes an inactive draft, and only a person filling the deciding role can apply it.
 - **Limits you can change without republishing.** Retries, wait times, run time and tool
   calls come from a settings table and are clamped to fixed bounds.
@@ -137,10 +137,9 @@ Builder** closes that gap without letting a model change production on its own.
 
 ```
 Scheduler (every 15 min)
- └ Data table: snapshot rows
-   └ Workflow Builder: Detect Changes        new / changed / removed steps, roles, agents
-     ├ store and remove snapshot rows
-     └ per change: Workflow Builder: Propose  ← chat model
+ └ Workflow Builder: Detect Changes          list_changes since the last run: new / changed
+   │                                         steps, changed / removed bound entities
+   └ per change: Workflow Builder: Propose    ← chat model
                     └ Create Draft            inactive, tagged rolealpha-draft
                       └ roleALPHA: Get Decider (governing step)
                         └ per person: Issue Approval Tokens → e-mail with approve / reject link
@@ -152,15 +151,31 @@ Confirm button (POST)
    └ reject  → Workflow Builder: Discard Draft
 ```
 
-**Detect** compares a fingerprint of every watched entity (name, custom ID, attributes and
-edges) with the rows stored last time. The first run only stores the snapshot. An entity that
-cannot be read is neither changed nor removed; removals count only when the complete index was
-read. Entities the server turns away (e.g. rate limit) are read once more one by one after a
-pause. One that stays unreadable in the first run gets a row with the fingerprint `pending` and
-is taken in silently once it can be read, instead of being reported as new.
+**Detect** asks roleALPHA's `list_changes` what changed effectively since the last run:
+approved drafts and every relationship change, fanned out to each end. That is one call per
+run, whatever the size of the organisation. It keeps the cursor in the workflow's static data,
+so no table is needed; the first run starts now and reports nothing from before. What counts:
+
+- new and changed entities of the watched types (default: steps), and
+- changed entities a managed workflow is bound to, whatever their type.
+
+What does not: relationships the runner reads at run time (who decides, is accountable,
+responsible, consulted or informed, who holds a role, which policy applies). A new holder or a new decider changes no workflow, so it costs no model
+call. A change names what changed, not the old values: the model compares the entity as it is
+now with what the workflows do. **Skip Own Changes** also leaves out what the connection's
+account proposed or approved (`ownChange`); use it only with an account of its own, since with
+a personal login it would leave out that person's approvals too.
+
+A deleted entity does not appear in the feed itself; its neighbours get a relationship whose
+other end is gone. Then, and when the cursor was lost, Detect asks for every bound entity
+whether it still exists. Only "not found" counts as removed; an entity it cannot tell is asked
+for again next run. A failed read of the feed fails the run and keeps the old cursor.
 
 **Propose** gives the model the change, the entity as roleALPHA shows it now (a step with its
-roles, never persons), the managed workflows and the credentials they use. Its answer is
+roles, never persons), the managed workflows, which of them the change affects (bound to the
+entity, or to a step right before, after, above or below it) and the credentials they use. An
+update for a neighbouring step leaves the binding as it is: the workflow does not become bound
+to the neighbour. Its answer is
 checked, and a failed check goes back to the model once more with the problems:
 
 - only node types from the allow list (no Code node by default),
@@ -185,29 +200,16 @@ Opening a link only shows a confirm page; mail scanners that open links decide n
 ### Setting it up
 
 Two ready workflows are in [`examples/`](examples). Installing the package does not set them
-up: n8n runs no code of a community package at install, so the data table and the credentials
-have to be created once by hand.
+up: n8n runs no code of a community package at install, so the credentials have to be created
+once by hand. No data table is needed; *Detect Changes* keeps its cursor in the workflow.
 
-1. **Create the data table.** In n8n open the project the workflows will live in (e.g.
-   *Personal*), go to the tab *Data tables*, create a table named `rolealpha_snapshot` and add
-   these columns, all of type **String**:
-
-   | Column | Holds |
-   |---|---|
-   | `uuid` | UUID of the entity (key of the row) |
-   | `entity_type` | `process`, `role`, `agent` … |
-   | `name` | Name at the last run |
-   | `custom_id` | Custom ID, may be empty |
-   | `fingerprint` | Hash over name, custom ID, attributes and edges |
-   | `fields` | JSON: a short hash per attribute |
-   | `edges` | JSON: the edges as `TYPE>uuid` / `TYPE<uuid` |
-   | `seen_at` | Time of the run that stored the row |
-
-   The name must be exactly `rolealpha_snapshot`; the example finds the table by name. Without
-   it, *Read snapshot* fails and nothing is detected.
+1. **Release the modules for AI in roleALPHA** (*AI settings → data release*). Without a
+   released module `list_changes` fails instead of reporting nothing.
 2. **Create the credentials** (see [Credentials](#credentials)):
-   - **MCP OAuth2** for roleALPHA. It must read the whole organisation, not just one agent.
-   - **n8n API** with an API key from *Settings → n8n API*. When `/api` is not reachable from
+   - **MCP OAuth2** for roleALPHA. It sees what its access may see: steps hidden from it are
+     neither watched nor reported.
+   - **n8n API** with an API key from *Settings → n8n API*. *Detect Changes* uses it too, to
+     read which entities the managed workflows are bound to. When `/api` is not reachable from
      outside, use `http://localhost:5678/api/v1` as base URL.
    - **Approval Seal API** with a random key of at least 32 characters. It signs the approval
      links; keep it secret, anybody with it can make links.
@@ -220,8 +222,9 @@ have to be created once by hand.
 5. **Set up the governing step in roleALPHA**, as described in the next section. Without it
    nobody may approve, and every draft stays a draft.
 6. **Activate** *Approve workflow drafts* first, then *Workflows follow the organisation*. The
-   first run only fills the data table and reports nothing; changes are reported from the
-   second run on.
+   first run starts now and only checks that the bound entities still exist; changes are
+   reported from the second run on. The cursor is kept only by runs of the active workflow:
+   a manual test run starts afresh each time.
 
 ### The governing step in roleALPHA
 
@@ -288,7 +291,7 @@ one mail per role.
 
 | Operation | What it does | Credential |
 |---|---|---|
-| Detect Changes | Compares the watched entity types (default: process, role, agent) with the stored snapshot rows. Returns `changes` (`created`, `changed` with `changedFields`, `edgesAdded`, `edgesRemoved`, `removed`), the rows to `upsert` and `remove`, and `unreadable`. | MCP OAuth2 |
+| Detect Changes | Reads `list_changes` from the cursor kept in the workflow (or the **Cursor** option). Returns `changes` (`created`, `changed`, `removed`, each with `relationships` and the bound `workflows`), `cursor`, `hasMore`, `started`, `checked`, `unreadable` and `skipped`. | MCP OAuth2, n8n API |
 | List Workflows | The managed workflows with their bound entities and the credentials they use. | n8n API |
 | Propose | Needs a chat model on its **Model** input. Returns `ok`, `action` (`create`, `update`, `deactivate`, `none`), `reason`, `workflow`, `contentHash`, `problems` and `notes`. | MCP OAuth2, n8n API |
 | Create Draft | Stores a proposal with `ok = true` as an inactive draft. Returns `draftId` and `contentHash`. | n8n API |
@@ -460,13 +463,15 @@ not caught by the graph.
 | `roleALPHA refused the run: agent_nicht_gebunden` | The function account may not run this agent. Add the agent under "May run these agents" of the account. |
 | `roleALPHA refused the run: kein_agent_run_recht` | No role of the function account has `agent:run`. |
 | `Acting as an agent needs a function account` | The MCP OAuth2 credential uses another grant type. Use the client ID and secret of a function account. |
-| `MCP initialize failed with HTTP 429` | Many runs started at once and roleALPHA turned some away. The client repeats a call turned away with 429 or 503 up to four times (Retry-After, else 1, 2, 4, 8 s). If it still fails, start fewer runs at once. |
+| `MCP initialize failed with HTTP 429` | Many runs started at once and roleALPHA turned some away (120 calls per minute and access). The client repeats a call turned away with 429 or 503 up to four times and waits as long as the server asks (Retry-After or RateLimit-Reset, else 1, 2, 4, 8 s). If it still fails, start fewer runs at once. |
 | `Empty MCP response` | The server answered with no body. Reading calls are repeated; a writing tool is not, so it cannot run twice. |
 | `Cannot access "arguments" due to security concerns` | n8n blocks the name `arguments` in expressions and in `$fromAI`. Name the tool input `toolArgs` or `args`. |
 | Propose returns `ok: false` | The model's answer failed the check twice; `problems` says why. Often a node type outside the allow list or a hard-coded address. Add what the model needs to **Extra Rules**. |
 | `The draft changed after it was proposed or approved` | Somebody edited the draft, or the link carries another hash. Discard it; the next change proposes again. |
 | `Workflow … changed after the draft was made` | The target was edited after the draft. Discard the draft and let the builder propose again. |
-| Detect fails with `more than Max Entities` | Every watched entity costs two reads per run. Watch fewer types or raise the limit. |
+| Detect fails with `kein Modul für die KI freigegeben` | No module is released for AI in roleALPHA. Release it under *AI settings → data release*. |
+| Detect reports `hasMore: true` | More changes waited than **Max Pages** × 500. The next run goes on from there. |
+| Detect reports the same change twice across runs | `list_changes` delivers at least once, after a restore of the tenant also known changes again. Proposals for them usually come back `none`. |
 | Webhook answers `401` | The `X-RA-Signature` does not match. Check the secret in **roleALPHA Webhook API**. |
 
 ## Licence

@@ -2,8 +2,9 @@ import type { IDataObject, IExecuteFunctions, INodeExecutionData, INodePropertie
 import { NodeConnectionTypes, NodeOperationError } from 'n8n-workflow';
 import { McpClient, type HttpReply } from '../../lib/mcp';
 import { McpGraphSource } from '../../lib/graph';
-import { detectChanges, ENTITY_TYPES, listIndex, readSnapshots, type EntityChange, type IndexEntry } from '../../lib/changes';
+import { boundEntities, detectChanges, ENTITY_TYPES, RUNTIME_RELATIONSHIPS, type EntityChange, type FeedState } from '../../lib/changes';
 import {
+	affectedWorkflows,
 	applyDraft,
 	buildPlanInput,
 	checkPlan,
@@ -24,7 +25,7 @@ import { issueToken, verifyToken } from '../../lib/approvalToken';
 
 const show = (operation: string[]) => ({ show: { operation } });
 const MCP_OPS = ['detectChanges', 'propose'];
-const N8N_OPS = ['listWorkflows', 'propose', 'createDraft', 'applyDraft', 'discardDraft'];
+const N8N_OPS = ['detectChanges', 'listWorkflows', 'propose', 'createDraft', 'applyDraft', 'discardDraft'];
 const TOKEN_OPS = ['issueTokens', 'verifyToken'];
 
 const properties: INodeProperties[] = [
@@ -34,7 +35,7 @@ const properties: INodeProperties[] = [
 		type: 'options',
 		noDataExpression: true,
 		options: [
-			{ name: 'Detect Changes', value: 'detectChanges', action: 'Detect new, changed and removed entities', description: 'Compares the roleALPHA graph with the stored snapshot rows' },
+			{ name: 'Detect Changes', value: 'detectChanges', action: 'Detect new, changed and removed entities', description: 'Asks roleALPHA what changed since the last run (list_changes) and keeps what matters for the workflows' },
 			{ name: 'List Workflows', value: 'listWorkflows', action: 'List managed workflows', description: 'The n8n workflows bound to roleALPHA entities, with their credentials' },
 			{ name: 'Propose', value: 'propose', action: 'Propose a workflow change with a model', description: 'Asks the attached model what a change means for the workflows and checks the answer' },
 			{ name: 'Create Draft', value: 'createDraft', action: 'Create an inactive draft from a proposal', description: 'Stores a checked proposal as an inactive draft workflow that waits for approval' },
@@ -65,20 +66,12 @@ const properties: INodeProperties[] = [
 
 	// ---------------------------------------------------------------- detect
 	{
-		displayName: 'Entity Types',
+		displayName: 'Watched Types',
 		name: 'entityTypes',
 		type: 'multiOptions',
 		options: ENTITY_TYPES.map((t) => ({ name: t.charAt(0).toUpperCase() + t.slice(1), value: t })),
-		default: ['process', 'role', 'agent'],
-		description: 'Entity types to watch. Rows of other types in the snapshot are left alone.',
-		displayOptions: show(['detectChanges']),
-	},
-	{
-		displayName: 'Snapshot Rows',
-		name: 'snapshotRows',
-		type: 'json',
-		default: '[]',
-		description: 'All stored rows (uuid, entity_type, name, custom_id, fingerprint, fields, edges, seen_at), e.g. from a data table. Empty on the first run: then the snapshot is stored and nothing is reported.',
+		default: ['process'],
+		description: 'New and changed entities of these types count even without a workflow. Entities a managed workflow is bound to always count.',
 		displayOptions: show(['detectChanges']),
 	},
 	{
@@ -90,26 +83,41 @@ const properties: INodeProperties[] = [
 		displayOptions: show(['detectChanges']),
 		options: [
 			{
-				displayName: 'Max Entities',
-				name: 'maxEntities',
-				type: 'number',
-				default: 500,
-				description: 'Fail when the watched types hold more entities; every entity costs two reads per run',
+				displayName: 'Cursor',
+				name: 'cursor',
+				type: 'string',
+				default: '',
+				description: 'Where to go on from, e.g. the cursor of the last run kept elsewhere. Empty: the cursor kept in the workflow itself.',
 			},
 			{
-				displayName: 'Report First Run',
-				name: 'reportBaseline',
+				displayName: 'Ignored Relationships',
+				name: 'ignoreRelationships',
+				type: 'string',
+				default: RUNTIME_RELATIONSHIPS.join(', '),
+				description: 'Comma-separated relationship types read at run time; a change to them changes no workflow',
+			},
+			{
+				displayName: 'Max Pages',
+				name: 'maxPages',
+				type: 'number',
+				default: 20,
+				typeOptions: { minValue: 1, maxValue: 100 },
+				description: 'Pages of up to 500 changes read per run; the rest waits for the next run',
+			},
+			{
+				displayName: 'Skip Own Changes',
+				name: 'skipOwn',
 				type: 'boolean',
 				default: false,
-				description: 'Whether every entity counts as created when no rows are stored yet',
+				description: 'Whether to leave out changes this connection\'s account proposed or approved. Only for an account of its own: with a personal login it would also leave out that person\'s approvals.',
 			},
 			{
-				displayName: 'Parallel Reads',
-				name: 'concurrency',
-				type: 'number',
-				default: 2,
-				description: 'Entities read at the same time. Entities the server turned away are read once more one by one after a pause.',
-				typeOptions: { minValue: 1, maxValue: 10 },
+				displayName: 'Start From',
+				name: 'since',
+				type: 'string',
+				default: '',
+				placeholder: '2026-11-01T00:00:00Z',
+				description: 'Only without a cursor: report changes from this time on. Empty: start now and report nothing from before.',
 			},
 		],
 	},
@@ -283,22 +291,28 @@ function answerText(res: unknown): string {
 function asChange(raw: unknown): EntityChange | null {
 	const c = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
 	if (!['created', 'changed', 'removed'].includes(String(c.change)) || typeof c.uuid !== 'string') return null;
-	const strings = (v: unknown) => (Array.isArray(v) ? v.map(String) : []);
+	const rels = Array.isArray(c.relationships) ? c.relationships : [];
 	return {
 		change: c.change as EntityChange['change'],
 		uuid: c.uuid.toLowerCase(),
-		name: String(c.name ?? ''),
 		entityType: String(c.entityType ?? ''),
+		name: String(c.name ?? ''),
 		customId: typeof c.customId === 'string' ? c.customId : null,
-		previousName: typeof c.previousName === 'string' ? c.previousName : null,
-		changedFields: strings(c.changedFields),
-		edgesAdded: strings(c.edgesAdded),
-		edgesRemoved: strings(c.edgesRemoved),
+		changedAt: typeof c.changedAt === 'string' ? c.changedAt : null,
+		relationships: rels
+			.filter((r): r is Record<string, unknown> => !!r && typeof r === 'object')
+			.map((r) => ({
+				type: String(r.type ?? ''),
+				action: (['added', 'changed', 'removed'].includes(String(r.action)) ? r.action : 'changed') as 'added' | 'changed' | 'removed',
+				otherUuid: typeof r.otherUuid === 'string' ? r.otherUuid.toLowerCase() : null,
+				end: typeof r.end === 'string' ? r.end : null,
+			})),
+		workflows: Array.isArray(c.workflows) ? c.workflows.map(String) : [],
 	};
 }
 
 /**
- * Keeps n8n workflows in line with roleALPHA: detects new and changed steps, roles and agents,
+ * Keeps n8n workflows in line with roleALPHA: detects new and changed steps and bound entities,
  * lets a model propose what that means for the workflows, and applies the proposal only as an
  * approved draft.
  */
@@ -310,7 +324,7 @@ export class RoleAlphaWorkflowBuilder implements INodeType {
 		group: ['transform'],
 		version: 1,
 		subtitle: '={{ $parameter["operation"] }}',
-		description: 'Let a model propose workflow changes when steps, roles or agents change in roleALPHA; apply them only after approval',
+		description: 'Let a model propose workflow changes when steps change in roleALPHA; apply them only after approval',
 		defaults: { name: 'roleALPHA Workflow Builder' },
 		inputs: `={{ ((operation) => operation === 'propose' ? ['main', { type: 'ai_languageModel', displayName: 'Model', required: true, maxConnections: 1 }] : ['main'])($parameter.operation) }}`,
 		outputs: [NodeConnectionTypes.Main],
@@ -334,26 +348,31 @@ export class RoleAlphaWorkflowBuilder implements INodeType {
 		const api = N8N_OPS.includes(operation) ? await n8nApiFor(this) : undefined;
 		const sealKey = TOKEN_OPS.includes(operation) ? String((await this.getCredentials('approvalSealApi')).key ?? '') : '';
 
-		// The snapshot is one decision over all stored rows.
+		// One run is one look at the feed, whatever the input items.
 		if (operation === 'detectChanges') {
-			const types = (this.getNodeParameter('entityTypes', 0, []) as string[]).filter(Boolean);
-			if (types.length === 0) throw new NodeOperationError(this.getNode(), 'Choose at least one entity type');
 			const opts = this.getNodeParameter('detectOptions', 0, {}) as IDataObject;
-			const max = typeof opts.maxEntities === 'number' && opts.maxEntities > 0 ? opts.maxEntities : 500;
-			const entries: IndexEntry[] = [];
-			// A failed index read throws: without the complete index nothing may count as removed.
-			for (const type of types) entries.push(...(await listIndex(getClient(0), organisationAt(0), type)));
-			if (entries.length > max) {
-				throw new NodeOperationError(this.getNode(), `The watched types hold ${entries.length} entities, more than Max Entities (${max}); narrow the types or raise the limit`);
-			}
-			const read = await readSnapshots(getGraph(0), entries, typeof opts.concurrency === 'number' ? opts.concurrency : 2);
-			const res = detectChanges(parseJsonParam(this, 'snapshotRows', 0), read.snapshots, {
-				complete: true,
-				types,
-				unreadable: read.unreadable,
-				reportBaseline: opts.reportBaseline === true,
+			const ignore = String(opts.ignoreRelationships ?? RUNTIME_RELATIONSHIPS.join(','))
+				.split(',')
+				.map((t) => t.trim())
+				.filter(Boolean);
+			const stored = this.getWorkflowStaticData('node') as FeedState & IDataObject;
+			const given = String(opts.cursor ?? '').trim();
+			const state: FeedState = given ? { cursor: given } : { cursor: stored.cursor, recheck: stored.recheck };
+			const { workflows } = summarizeWorkflows(await api!.listWorkflows(MANAGED_TAG));
+			const res = await detectChanges(getClient(0), organisationAt(0), state, {
+				bound: boundEntities(workflows),
+				watchTypes: (this.getNodeParameter('entityTypes', 0, []) as string[]).filter(Boolean),
+				ignoreRelationships: ignore,
+				skipOwn: opts.skipOwn === true,
+				since: String(opts.since ?? '').trim() || undefined,
+				maxPages: typeof opts.maxPages === 'number' ? opts.maxPages : 20,
 			});
-			return [[{ json: { ...res, watched: entries.length } as unknown as IDataObject }]];
+			// Kept only after the feed was read in full; a failed run leaves the old cursor.
+			stored.cursor = res.state.cursor;
+			if (res.state.recheck) stored.recheck = true;
+			else delete stored.recheck;
+			const { state: _state, ...json } = res;
+			return [[{ json: { ...json, bound: workflows.filter((w) => !w.isDraft).length } as unknown as IDataObject }]];
 		}
 
 		if (operation === 'listWorkflows') {
@@ -376,7 +395,17 @@ export class RoleAlphaWorkflowBuilder implements INodeType {
 						.split(/\r?\n/)
 						.map((r) => r.trim())
 						.filter(Boolean);
-					const ctx = { change, entity: await entityContext(getGraph(i), change), workflows: managed.workflows, credentials: managed.credentials, nodeTypes: nodeTypes.length ? nodeTypes : DEFAULT_NODE_TYPES, extraRules };
+					const entity = await entityContext(getGraph(i), change);
+					// The feed names no values; name and custom ID come from roleALPHA as it is now.
+					if (change.change !== 'removed') {
+						const d = await getGraph(i).details(change.uuid);
+						change.name = d.name || change.name;
+						change.customId = d.customId ?? change.customId;
+						change.entityType = change.entityType || d.entityType;
+					} else if (!change.name) {
+						change.name = managed.workflows.find((w) => change.workflows.includes(w.id))?.name ?? '';
+					}
+					const ctx = { change, entity, workflows: managed.workflows, affected: affectedWorkflows(change, entity, managed.workflows), credentials: managed.credentials, nodeTypes: nodeTypes.length ? nodeTypes : DEFAULT_NODE_TYPES, extraRules };
 					const input = buildPlanInput(ctx);
 					const model = (await this.getInputConnectionData(NodeConnectionTypes.AiLanguageModel, 0)) as { invoke?: (messages: unknown) => Promise<unknown> } | undefined;
 					if (!model || typeof model.invoke !== 'function') throw new NodeOperationError(this.getNode(), 'Attach a chat model to the Model input', { itemIndex: i });
