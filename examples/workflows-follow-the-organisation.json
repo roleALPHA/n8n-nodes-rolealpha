@@ -148,7 +148,7 @@
         "endpointUrl": "={{ $('Settings').first().json.endpointUrl }}",
         "organisation": "={{ $('Settings').first().json.organisation }}",
         "change": "={{ $json }}",
-        "extraRules": "Systems: Directus (collections are named in the domains of the roles).\nThe generic runner is the workflow \"roleALPHA: Runner\"; start it with Execute Workflow and pass agentUuid, step and trigger.",
+        "extraRules": "Systems: Directus (collections are named in the domains of the roles).\nThe generic runner is the workflow \"roleALPHA: Runner\"; start it with Execute Workflow and pass agentUuid, step and trigger.\nThe steps with Custom-ID automation:* are run by the Workflow Builder itself. Never propose a workflow for them.",
         "maxAttempts": 2
       },
       "credentials": {

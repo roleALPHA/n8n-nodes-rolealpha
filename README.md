@@ -218,7 +218,8 @@ once by hand. No data table is needed; *Detect Changes* keeps its cursor in the 
    `approve-workflow-drafts.json`, and pick the credentials on every node that asks for one.
 4. **Fill in Settings** in both workflows: `endpointUrl` and `organisation` of roleALPHA,
    `governingStep`, and in the first one `n8nUrl`, `approvalUrl` (`<n8nUrl>/webhook/rolealpha-workflow-approval`)
-   and `mailFrom`.
+   and `mailFrom`. Adjust **Extra Rules** on *Propose* to your systems and runner; the last
+   rule keeps the builder off its own steps (see [The builder's own steps](#the-builders-own-steps)).
 5. **Set up the governing step in roleALPHA**, as described in the next section. Without it
    nobody may approve, and every draft stays a draft.
 6. **Activate** *Approve workflow drafts* first, then *Workflows follow the organisation*. The
@@ -258,6 +259,20 @@ Changing who approves later needs no change in n8n: give the role to someone els
 `DECIDES_ON` at another role. The next mail goes to the new holders, and links of someone who
 no longer fills the role do nothing. A person who fills two deciding roles of the step gets
 one mail per role.
+
+### The builder's own steps
+
+The builder may be modelled in roleALPHA like any other value chain: a process with the steps
+*detect changes*, *propose a draft* and the governing step, a role responsible for them and an
+agent that fills the role. Its two workflows are not managed (they carry no binding), so for
+the model such a step has no workflow yet. Approving these steps then makes it propose a
+second detect workflow, or not, by chance. Give the builder's steps custom IDs of one prefix,
+e.g. `automation:workflow-detect` and `automation:workflow-propose`, and name the prefix in
+**Extra Rules** of *Propose*. The example workflow already has the rule:
+
+```
+The steps with Custom-ID automation:* are run by the Workflow Builder itself. Never propose a workflow for them.
+```
 
 ## Nodes
 
@@ -467,6 +482,7 @@ not caught by the graph.
 | `Empty MCP response` | The server answered with no body. Reading calls are repeated; a writing tool is not, so it cannot run twice. |
 | `Cannot access "arguments" due to security concerns` | n8n blocks the name `arguments` in expressions and in `$fromAI`. Name the tool input `toolArgs` or `args`. |
 | Propose returns `ok: false` | The model's answer failed the check twice; `problems` says why. Often a node type outside the allow list or a hard-coded address. Add what the model needs to **Extra Rules**. |
+| Propose drafts a second detect workflow | The builder's own steps are modelled in roleALPHA and the model does not know that the builder runs them. Reject the draft and add the rule from [The builder's own steps](#the-builders-own-steps). |
 | `The draft changed after it was proposed or approved` | Somebody edited the draft, or the link carries another hash. Discard it; the next change proposes again. |
 | `Workflow … changed after the draft was made` | The target was edited after the draft. Discard the draft and let the builder propose again. |
 | Detect fails with `kein Modul für die KI freigegeben` | No module is released for AI in roleALPHA. Release it under *AI settings → data release*. |
