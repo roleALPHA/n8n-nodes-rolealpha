@@ -11,7 +11,7 @@
         -420
       ],
       "parameters": {
-        "content": "## Workflows follow the organisation\nEvery 15 minutes the builder compares the roleALPHA graph with the snapshot table `rolealpha_snapshot` (columns: uuid, entity_type, name, custom_id, fingerprint, fields, edges, seen_at \u2014 all text).\n\nFor every new, changed or removed step, role or agent, the model proposes what that means for the n8n workflows. A usable proposal becomes an **inactive draft**, and every person filling the deciding role of the governing step gets an e-mail with links to approve or reject it (workflow *roleALPHA: Approve workflow drafts*).\n\nSet the values in **Settings** and the credentials (roleALPHA MCP OAuth2, n8n API, Approval Seal, Anthropic, SMTP). The links are signed one-time tokens: each is bound to the draft, its content, the person and the decision, and expires after 7 days. The first run only stores the snapshot.",
+        "content": "## Workflows follow the organisation\nEvery 15 minutes the builder asks roleALPHA what changed since the last run (`list_changes`, one call instead of reading the whole organisation). It keeps the cursor in this workflow, so it needs no table.\n\nFor every new or changed step, and for every entity a managed workflow is bound to, the model proposes what that means for the n8n workflows. A usable proposal becomes an **inactive draft**, and every person filling the deciding role of the governing step gets an e-mail with links to approve or reject it (workflow *roleALPHA: Approve workflow drafts*).\n\nSet the values in **Settings** and the credentials (roleALPHA MCP OAuth2, n8n API, Approval Seal, Anthropic, SMTP). The links are signed one-time tokens: each is bound to the draft, its content, the person and the decision, and expires after 7 days. The first run starts now and reports nothing from before. Changes to who decides or holds a role are left out: workflows read them at run time.",
         "width": 620,
         "height": 340
       }
@@ -91,33 +91,12 @@
       }
     },
     {
-      "id": "75383fdb-0e1b-5d65-8f5b-07db6c340c27",
-      "name": "Read snapshot",
-      "type": "n8n-nodes-base.dataTable",
-      "typeVersion": 1.1,
-      "position": [
-        440,
-        0
-      ],
-      "parameters": {
-        "resource": "row",
-        "operation": "get",
-        "dataTableId": {
-          "__rl": true,
-          "mode": "name",
-          "value": "rolealpha_snapshot"
-        },
-        "returnAll": true
-      },
-      "alwaysOutputData": true
-    },
-    {
       "id": "b5da7e1e-bc12-56f5-858c-75e8f9748996",
       "name": "Detect changes",
       "type": "@rolealpha/n8n-nodes-rolealpha.roleAlphaWorkflowBuilder",
       "typeVersion": 1,
       "position": [
-        660,
+        440,
         0
       ],
       "parameters": {
@@ -125,11 +104,8 @@
         "endpointUrl": "={{ $('Settings').first().json.endpointUrl }}",
         "organisation": "={{ $('Settings').first().json.organisation }}",
         "entityTypes": [
-          "process",
-          "role",
-          "agent"
+          "process"
         ],
-        "snapshotRows": "={{ $('Read snapshot').all().map((i) => i.json) }}",
         "detectOptions": {}
       },
       "executeOnce": true,
@@ -137,97 +113,11 @@
         "mcpOAuth2Api": {
           "id": "",
           "name": "roleALPHA MCP"
+        },
+        "n8nApi": {
+          "id": "",
+          "name": "n8n API"
         }
-      }
-    },
-    {
-      "id": "76a58d8c-5a80-5b65-8c3d-a3fdfbb873b6",
-      "name": "Rows to store",
-      "type": "n8n-nodes-base.splitOut",
-      "typeVersion": 1,
-      "position": [
-        900,
-        -200
-      ],
-      "parameters": {
-        "fieldToSplitOut": "upsert",
-        "options": {}
-      }
-    },
-    {
-      "id": "3f108940-6e6f-5779-b162-704b7bf5c993",
-      "name": "Store row",
-      "type": "n8n-nodes-base.dataTable",
-      "typeVersion": 1.1,
-      "position": [
-        1120,
-        -200
-      ],
-      "parameters": {
-        "resource": "row",
-        "operation": "upsert",
-        "dataTableId": {
-          "__rl": true,
-          "mode": "name",
-          "value": "rolealpha_snapshot"
-        },
-        "filters": {
-          "conditions": [
-            {
-              "keyName": "uuid",
-              "condition": "eq",
-              "keyValue": "={{ $json.uuid }}"
-            }
-          ]
-        },
-        "columns": {
-          "mappingMode": "autoMapInputData",
-          "value": null
-        },
-        "options": {}
-      }
-    },
-    {
-      "id": "895fbbca-7dd7-5f5e-b128-eacc8ab6a503",
-      "name": "Rows to remove",
-      "type": "n8n-nodes-base.splitOut",
-      "typeVersion": 1,
-      "position": [
-        900,
-        -40
-      ],
-      "parameters": {
-        "fieldToSplitOut": "remove",
-        "options": {}
-      }
-    },
-    {
-      "id": "e0ac7c93-b860-5cac-bdfa-8283aa07cbb7",
-      "name": "Remove row",
-      "type": "n8n-nodes-base.dataTable",
-      "typeVersion": 1.1,
-      "position": [
-        1120,
-        -40
-      ],
-      "parameters": {
-        "resource": "row",
-        "operation": "deleteRows",
-        "dataTableId": {
-          "__rl": true,
-          "mode": "name",
-          "value": "rolealpha_snapshot"
-        },
-        "filters": {
-          "conditions": [
-            {
-              "keyName": "uuid",
-              "condition": "eq",
-              "keyValue": "={{ $json.remove }}"
-            }
-          ]
-        },
-        "options": {}
       }
     },
     {
@@ -236,8 +126,8 @@
       "type": "n8n-nodes-base.splitOut",
       "typeVersion": 1,
       "position": [
-        900,
-        160
+        660,
+        0
       ],
       "parameters": {
         "fieldToSplitOut": "changes",
@@ -250,8 +140,8 @@
       "type": "@rolealpha/n8n-nodes-rolealpha.roleAlphaWorkflowBuilder",
       "typeVersion": 1,
       "position": [
-        1120,
-        160
+        900,
+        0
       ],
       "parameters": {
         "operation": "propose",
@@ -278,8 +168,8 @@
       "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
       "typeVersion": 1.6,
       "position": [
-        1120,
-        380
+        900,
+        220
       ],
       "parameters": {
         "model": {
@@ -304,8 +194,8 @@
       "type": "n8n-nodes-base.filter",
       "typeVersion": 2.3,
       "position": [
-        1340,
-        160
+        1120,
+        0
       ],
       "parameters": {
         "conditions": {
@@ -347,8 +237,8 @@
       "type": "@rolealpha/n8n-nodes-rolealpha.roleAlphaWorkflowBuilder",
       "typeVersion": 1,
       "position": [
-        1560,
-        160
+        1340,
+        0
       ],
       "parameters": {
         "operation": "createDraft",
@@ -367,8 +257,8 @@
       "type": "@rolealpha/n8n-nodes-rolealpha.roleAlpha",
       "typeVersion": 1,
       "position": [
-        1780,
-        160
+        1560,
+        0
       ],
       "parameters": {
         "resource": "responsibility",
@@ -391,8 +281,8 @@
       "type": "n8n-nodes-base.splitOut",
       "typeVersion": 1,
       "position": [
-        2000,
-        160
+        1780,
+        0
       ],
       "parameters": {
         "fieldToSplitOut": "roles",
@@ -405,8 +295,8 @@
       "type": "n8n-nodes-base.splitOut",
       "typeVersion": 1,
       "position": [
-        2220,
-        160
+        2000,
+        0
       ],
       "parameters": {
         "fieldToSplitOut": "holders.persons",
@@ -419,8 +309,8 @@
       "type": "@rolealpha/n8n-nodes-rolealpha.roleAlphaWorkflowBuilder",
       "typeVersion": 1,
       "position": [
-        2440,
-        160
+        2220,
+        0
       ],
       "parameters": {
         "operation": "issueTokens",
@@ -442,8 +332,8 @@
       "type": "n8n-nodes-base.emailSend",
       "typeVersion": 2.1,
       "position": [
-        2660,
-        160
+        2440,
+        0
       ],
       "parameters": {
         "operation": "send",
@@ -480,17 +370,6 @@
       "main": [
         [
           {
-            "node": "Read snapshot",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Read snapshot": {
-      "main": [
-        [
-          {
             "node": "Detect changes",
             "type": "main",
             "index": 0
@@ -502,39 +381,7 @@
       "main": [
         [
           {
-            "node": "Rows to store",
-            "type": "main",
-            "index": 0
-          },
-          {
-            "node": "Rows to remove",
-            "type": "main",
-            "index": 0
-          },
-          {
             "node": "Changes",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Rows to store": {
-      "main": [
-        [
-          {
-            "node": "Store row",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Rows to remove": {
-      "main": [
-        [
-          {
-            "node": "Remove row",
             "type": "main",
             "index": 0
           }
