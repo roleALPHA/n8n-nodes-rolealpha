@@ -11,9 +11,9 @@
         -420
       ],
       "parameters": {
-        "content": "## Workflows follow the organisation\nEvery 15 minutes the builder asks roleALPHA what changed since the last run (`list_changes`, one call instead of reading the whole organisation). It keeps the cursor in this workflow, so it needs no table.\n\nFor every new or changed step, and for every entity a managed workflow is bound to, the model proposes what that means for the n8n workflows. A usable proposal becomes an **inactive draft**, and every person filling the deciding role of the governing step gets an e-mail with links to approve or reject it (workflow *roleALPHA: Approve workflow drafts*).\n\nSet the values in **Settings** and the credentials (roleALPHA MCP OAuth2, n8n API, Approval Seal, Anthropic, SMTP). The links are signed one-time tokens: each is bound to the draft, its content, the person and the decision, and expires after 7 days. The first run starts now and reports nothing from before. Changes to who decides or holds a role are left out: workflows read them at run time.",
+        "content": "## Workflows follow the organisation\nEvery 15 minutes the builder asks roleALPHA what changed since the last run (`list_changes`, one call instead of reading the whole organisation). It keeps the cursor in this workflow, so it needs no table.\n\n**Propose** decides clear cases by rule, without a model: the builder's own steps, decisions by people, steps that only group others, and steps the scheduler starts by their frequency. For the rest it asks the model, which sees all workflows and the inputs of the runner, and checks the answer. A usable proposal becomes an **inactive draft**, and every person filling the deciding role of the governing step gets an e-mail with what changes and links to approve or reject it (workflow *roleALPHA: Approve workflow drafts*). Drafts that change Code nodes go to the code governing step instead.\n\nIf the model is away the change comes back next run. What cannot be proposed at all is reported to the same people.\n\nSet the values in **Settings**, **Runner Workflow** on *Propose* and the credentials (roleALPHA MCP OAuth2, n8n API, Approval Seal, Anthropic, SMTP). The first run starts now and reports nothing from before.",
         "width": 620,
-        "height": 340
+        "height": 420
       }
     },
     {
@@ -65,6 +65,12 @@
               "id": "f86905f5-0e6f-5ef7-9d89-51834d18eb3e",
               "name": "governingStep",
               "value": "automation:workflow-changes",
+              "type": "string"
+            },
+            {
+              "id": "83ffad96-0bf1-59f6-934b-d65650901801",
+              "name": "codeGoverningStep",
+              "value": "automation:workflow-code-changes",
               "type": "string"
             },
             {
@@ -148,8 +154,11 @@
         "endpointUrl": "={{ $('Settings').first().json.endpointUrl }}",
         "organisation": "={{ $('Settings').first().json.organisation }}",
         "change": "={{ $json }}",
-        "extraRules": "Systems: Directus (collections are named in the domains of the roles).\nThe generic runner is the workflow \"roleALPHA: Runner\"; start it with Execute Workflow and pass agentUuid, step and trigger.\nThe steps with Custom-ID automation:* are run by the Workflow Builder itself. Never propose a workflow for them.",
-        "maxAttempts": 2
+        "extraRules": "Systems: Directus (collections are named in the domains of the roles).",
+        "maxAttempts": 2,
+        "proposeOptions": {
+          "runnerWorkflow": "roleALPHA: Runner"
+        }
       },
       "credentials": {
         "mcpOAuth2Api": {
@@ -265,7 +274,7 @@
         "operation": "getDecider",
         "endpointUrl": "={{ $('Settings').first().json.endpointUrl }}",
         "organisation": "={{ $('Settings').first().json.organisation }}",
-        "step": "={{ $('Settings').first().json.governingStep }}",
+        "step": "={{ $('Create draft').item.json.codeChanged ? $('Settings').first().json.codeGoverningStep : $('Settings').first().json.governingStep }}",
         "responsibilityOptions": {}
       },
       "credentials": {
@@ -339,9 +348,9 @@
         "operation": "send",
         "fromEmail": "={{ $('Settings').first().json.mailFrom }}",
         "toEmail": "={{ $json.email }}",
-        "subject": "=Workflow change to approve: {{ $('Create draft').item.json.draftName }}",
+        "subject": "=Workflow change to approve{{ $('Create draft').item.json.codeChanged ? ' (with code)' : '' }}: {{ $('Create draft').item.json.draftName }}",
         "emailFormat": "html",
-        "html": "=<p>{{ $('Create draft').item.json.entityName }} was {{ $('Create draft').item.json.change }} in roleALPHA. The model proposes to <b>{{ $('Create draft').item.json.action }}</b> a workflow:</p><blockquote>{{ $('Create draft').item.json.reason }}</blockquote>{{ $('Create draft').item.json.notes.length ? '<p>Before approving: ' + $('Create draft').item.json.notes.join('; ') + '</p>' : '' }}<p><a href=\"{{ $('Settings').first().json.n8nUrl }}/workflow/{{ $('Create draft').item.json.draftId }}\">Look at the draft</a></p><p><a href=\"{{ $('Settings').first().json.approvalUrl }}?token={{ $json.approveToken }}\">Approve</a> \u00b7 <a href=\"{{ $('Settings').first().json.approvalUrl }}?token={{ $json.rejectToken }}\">Reject</a></p><p>The links are for you alone and work once, until {{ DateTime.fromISO($json.tokenExpiresAt).toFormat('yyyy-MM-dd HH:mm') }}. You get this because you fill {{ $('Deciding roles').item.json.name }}.</p>",
+        "html": "=<p>{{ $('Create draft').item.json.entityName }} was {{ $('Create draft').item.json.change }} in roleALPHA. The model proposes to <b>{{ $('Create draft').item.json.action }}</b> a workflow:</p><blockquote>{{ $('Create draft').item.json.reason }}</blockquote>{{ $('Create draft').item.json.notes.length ? '<p>Before approving: ' + $('Create draft').item.json.notes.join('; ') + '</p>' : '' }}{{ $('Create draft').item.json.reviewHtml }}<p><a href=\"{{ $('Settings').first().json.n8nUrl }}/workflow/{{ $('Create draft').item.json.draftId }}\">Look at the draft</a></p><p><a href=\"{{ $('Settings').first().json.approvalUrl }}?token={{ $json.approveToken }}\">Approve</a> · <a href=\"{{ $('Settings').first().json.approvalUrl }}?token={{ $json.rejectToken }}\">Reject</a></p><p>The links are for you alone and work once, until {{ DateTime.fromISO($json.tokenExpiresAt).toFormat('yyyy-MM-dd HH:mm') }}. You get this because you fill {{ $('Deciding roles').item.json.name }}.</p>",
         "options": {
           "appendAttribution": false
         }
@@ -350,6 +359,119 @@
         "smtp": {
           "id": "",
           "name": "SMTP"
+        }
+      }
+    },
+    {
+      "id": "ea1f33ef-ff06-5304-871c-8f812fe9e712",
+      "name": "Needs attention?",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2.3,
+      "position": [
+        1120,
+        320
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "8973dfaf-02cf-5780-98fd-77da7325877f",
+              "leftValue": "={{ $json.ok === false && $json.retry !== true }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "c2e9e8c2-78b3-5cbb-930c-794d05113dd6",
+      "name": "Who is told",
+      "type": "@rolealpha/n8n-nodes-rolealpha.roleAlpha",
+      "typeVersion": 1,
+      "position": [
+        1340,
+        320
+      ],
+      "credentials": {
+        "mcpOAuth2Api": {
+          "id": "",
+          "name": "roleALPHA MCP"
+        }
+      },
+      "parameters": {
+        "resource": "responsibility",
+        "operation": "getDecider",
+        "endpointUrl": "={{ $('Settings').first().json.endpointUrl }}",
+        "organisation": "={{ $('Settings').first().json.organisation }}",
+        "step": "={{ $('Settings').first().json.governingStep }}",
+        "responsibilityOptions": {}
+      }
+    },
+    {
+      "id": "563fbf3f-ac91-5e64-88fb-48be18eb4ead",
+      "name": "Told roles",
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [
+        1560,
+        320
+      ],
+      "parameters": {
+        "fieldToSplitOut": "roles",
+        "options": {}
+      }
+    },
+    {
+      "id": "d4a9adf7-14f5-52b8-9dd6-a7bd67c08f37",
+      "name": "Told persons",
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [
+        1780,
+        320
+      ],
+      "parameters": {
+        "fieldToSplitOut": "holders.persons",
+        "options": {}
+      }
+    },
+    {
+      "id": "a707a82c-e15d-5922-879f-a4d78aec4b75",
+      "name": "Tell about problem",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        2000,
+        320
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "",
+          "name": "SMTP"
+        }
+      },
+      "parameters": {
+        "operation": "send",
+        "fromEmail": "={{ $('Settings').first().json.mailFrom }}",
+        "toEmail": "={{ $json.email }}",
+        "subject": "=No workflow proposal for {{ $('Needs attention?').item.json.change.name }}",
+        "emailFormat": "html",
+        "html": "=<p>{{ ($('Needs attention?').item.json.change.name || '').replace(/</g, '&lt;') }} was {{ $('Needs attention?').item.json.change.change }} in roleALPHA, and the builder could not propose what that means for the workflows:</p><pre>{{ $('Needs attention?').item.json.problems.join('\\n').replace(/</g, '&lt;') }}</pre><p>Nothing was changed. If the step needs a workflow, build it by hand or change the step so the next run can propose one.</p>",
+        "options": {
+          "appendAttribution": false
         }
       }
     }
@@ -417,6 +539,11 @@
             "node": "Usable proposal?",
             "type": "main",
             "index": 0
+          },
+          {
+            "node": "Needs attention?",
+            "type": "main",
+            "index": 0
           }
         ]
       ]
@@ -481,6 +608,50 @@
         [
           {
             "node": "Ask for approval",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs attention?": {
+      "main": [
+        [
+          {
+            "node": "Who is told",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Who is told": {
+      "main": [
+        [
+          {
+            "node": "Told roles",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Told roles": {
+      "main": [
+        [
+          {
+            "node": "Told persons",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Told persons": {
+      "main": [
+        [
+          {
+            "node": "Tell about problem",
             "type": "main",
             "index": 0
           }

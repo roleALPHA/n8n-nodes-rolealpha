@@ -172,6 +172,7 @@ const planCtx = (workflows: N8nWorkflow[] = [managedWf('w1')]): PlanContext => {
 const newWorkflow = (nodes: unknown[], connections: unknown = {}) => ({ action: 'create', reason: 'New step needs a schedule', targetWorkflowId: null, workflow: { name: 'Publish schedule', nodes, connections } });
 const schedule = { name: 'Every hour', type: 'n8n-nodes-base.scheduleTrigger', typeVersion: 1.2, parameters: { rule: { interval: [{ field: 'hours' }] } } };
 const runner = { name: 'Run step', type: 'n8n-nodes-base.executeWorkflow', typeVersion: 1.2, parameters: { stepCustomId: 'mk:publish' } };
+const wired = { 'Every hour': { main: [[{ node: 'Run step', type: 'main', index: 0 }]] } };
 
 test('A clean proposal passes and gets IDs, positions and a hash', () => {
 	const res = checkPlan(planCtx(), JSON.stringify(newWorkflow([schedule, runner], { 'Every hour': { main: [[{ node: 'Run step', type: 'main', index: 0 }]] } })));
@@ -217,7 +218,7 @@ test('An update keeps IDs, credentials and webhooks of nodes that stay; unknown 
 				{ name: 'Map', type: 'n8n-nodes-base.set', typeVersion: 3.4, parameters: {}, credentials: { httpHeaderAuth: { id: 'zzz', name: 'Guess' } } },
 				{ name: 'roleALPHA binding', type: 'n8n-nodes-base.stickyNote', typeVersion: 1, parameters: { content: 'rolealpha:{"managed":true,"entities":[]}' } },
 			],
-			connections: {},
+			connections: { Hook: { main: [[{ node: 'Store', type: 'main', index: 0 }, { node: 'Map', type: 'main', index: 0 }]] } },
 		},
 	};
 	const res = checkPlan(planCtx([target]), answer, target);
@@ -275,7 +276,7 @@ function fakeN8n(initial: N8nWorkflow[]) {
 
 test('A created draft becomes the workflow only with the approved hash', async () => {
 	const { api, store } = fakeN8n([managedWf('w1')]);
-	const plan = checkPlan(planCtx(), newWorkflow([schedule, runner]));
+	const plan = checkPlan(planCtx(), newWorkflow([schedule, runner], wired));
 	const draft = await api.create(draftWorkflow(plan, change));
 	assert.ok(draft.name.startsWith('Draft: '));
 	const { hash } = draftHash(draft);
@@ -297,7 +298,7 @@ test('A created draft becomes the workflow only with the approved hash', async (
 test('An update applies onto the target and refuses a target that moved on', async () => {
 	const { api, store } = fakeN8n([managedWf('w1')]);
 	const target = await api.get('w1');
-	const answer = { action: 'update', reason: 'Route it', targetWorkflowId: 'w1', workflow: { name: 'Event router', nodes: [...target.nodes.slice(0, 2), { name: 'Map', type: 'n8n-nodes-base.set', typeVersion: 3.4, parameters: {} }], connections: {} } };
+	const answer = { action: 'update', reason: 'Route it', targetWorkflowId: 'w1', workflow: { name: 'Event router', nodes: [...target.nodes.slice(0, 2), { name: 'Map', type: 'n8n-nodes-base.set', typeVersion: 3.4, parameters: {} }], connections: { Hook: { main: [[{ node: 'Store', type: 'main', index: 0 }, { node: 'Map', type: 'main', index: 0 }]] } } } };
 	const plan = checkPlan(planCtx([target]), answer, target);
 	const draft = await api.create(draftWorkflow(plan, change, target));
 	const { hash } = draftHash(draft);
@@ -389,7 +390,7 @@ test('A change to a neighbouring step updates the workflow without binding the n
 	assert.deepEqual(affected, [{ workflowId: 'w1', name: 'Event router', as: 'neighbour' }]);
 	const ctx: PlanContext = { change: neighbour, entity, workflows: m.workflows, affected, credentials: m.credentials, nodeTypes: DEFAULT_NODE_TYPES };
 	const target = await api.get('w1');
-	const plan = checkPlan(ctx, { action: 'update', reason: 'Hand over to the new custom ID', targetWorkflowId: 'w1', workflow: { name: 'Event router', nodes: target.nodes.slice(0, 2), connections: {} } }, target);
+	const plan = checkPlan(ctx, { action: 'update', reason: 'Hand over to the new custom ID', targetWorkflowId: 'w1', workflow: { name: 'Event router', nodes: target.nodes.slice(0, 2), connections: target.connections } }, target);
 	assert.equal(plan.ok, true, plan.problems.join('; '));
 	assert.equal(plan.bindEntity, false);
 	const draft = await api.create(draftWorkflow(plan, neighbour, target));
@@ -447,7 +448,7 @@ test('An approval token carries draft, hash, person and decision, and nothing el
 
 test('The links of Issue Approval Tokens work once: Verify gives the claims, a second Apply finds no draft', async () => {
 	const n8n = fakeN8n([managedWf('w1')]);
-	const plan = checkPlan(planCtx(), newWorkflow([schedule, runner]));
+	const plan = checkPlan(planCtx(), newWorkflow([schedule, runner], wired));
 	const draft = await n8n.api.create(draftWorkflow(plan, change));
 	const { hash } = draftHash(draft);
 	const builder = new RoleAlphaWorkflowBuilder();

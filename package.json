@@ -1,6 +1,6 @@
 {
   "name": "@rolealpha/n8n-nodes-rolealpha",
-  "version": "0.8.1",
+  "version": "0.9.0",
   "description": "n8n nodes for running AI agents whose roles, duties, deciders and guardrails live in roleALPHA",
   "keywords": [
     "n8n-community-node-package",
@@ -56,5 +56,8 @@
   },
   "peerDependencies": {
     "n8n-workflow": "*"
+  },
+  "dependencies": {
+    "acorn": "^8.19.0"
   }
 }

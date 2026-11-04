@@ -139,14 +139,15 @@ Builder** closes that gap without letting a model change production on its own.
 Scheduler (every 15 min)
  └ Workflow Builder: Detect Changes          list_changes since the last run: new / changed
    │                                         steps, changed / removed bound entities
-   └ per change: Workflow Builder: Propose    ← chat model
-                    └ Create Draft            inactive, tagged rolealpha-draft
-                      └ roleALPHA: Get Decider (governing step)
-                        └ per person: Issue Approval Tokens → e-mail with approve / reject link
+   └ per change: Workflow Builder: Propose    rule first, else ← chat model; checks the answer
+                    ├ Create Draft            inactive, tagged rolealpha-draft, with what changes
+                    │ └ roleALPHA: Get Decider (governing step; for Code nodes the code step)
+                    │   └ per person: Issue Approval Tokens → e-mail with approve / reject link
+                    └ nothing usable → e-mail to the same people; model away → again next run
 
 Approval link (GET)  → Verify Approval Token → page with a confirm button
 Confirm button (POST)
- └ Verify Approval Token → roleALPHA: Check Approver (governing step, fail-closed)
+ └ Verify Approval Token → Read Draft → roleALPHA: Check Approver (that step, fail-closed)
    ├ approve → Workflow Builder: Apply Draft   only with the hash in the token
    └ reject  → Workflow Builder: Discard Draft
 ```
@@ -171,20 +172,79 @@ other end is gone. Then, and when the cursor was lost, Detect asks for every bou
 whether it still exists. Only "not found" counts as removed; an entity it cannot tell is asked
 for again next run. A failed read of the feed fails the run and keeps the old cursor.
 
-**Propose** gives the model the change, the entity as roleALPHA shows it now (a step with its
-roles, never persons), the managed workflows, which of them the change affects (bound to the
-entity, or to a step right before, after, above or below it) and the credentials they use. An
-update for a neighbouring step leaves the binding as it is: the workflow does not become bound
-to the neighbour. Its answer is
-checked, and a failed check goes back to the model once more with the problems:
+**Propose decides clear cases itself**, with the same result every time and no model call
+(`decidedBy: rule`, and `rule` says which):
 
-- only node types from the allow list (no Code node by default),
+| `rule` | When, and only if no workflow depends on the step |
+|---|---|
+| `own_step` | The custom ID starts with one of **Own Step Prefixes** (default `automation:`). This one applies even if a workflow depends on it. |
+| `draft_waiting` | A draft already covers this change. `list_changes` delivers at least once. This one too. |
+| `decision` | The step is a gate: a person decides, and the approval reads who at run time. |
+| `grouping` | The process only groups other steps; they get their own proposals. |
+| `scheduled` | The step has a frequency and the generic scheduler starts it (**Scheduler Covers Frequency**, on by default; switch it off without such a scheduler). |
+| `retired` | The step is archived or retired. |
+
+**For the rest it asks the model**, and gives it the change, the entity as roleALPHA shows it now
+(a step with its roles, never persons), the managed workflows, which of them the change
+affects (bound to the entity, or to a step right before, after, above or below it), the
+credentials they use, all other workflows with their triggers (to read, not to change) and the
+runner with its inputs. An update for a neighbouring step leaves the binding as it is: the
+workflow does not become bound to the neighbour.
+
+**Templates** cover what most steps need: a trigger, then the agents responsible for the step,
+then the runner. The model only answers `template: schedule` with a cron expression, or
+`template: event` for a step another system starts over a webhook. The builder writes the
+workflow, so it looks the same every time, and maps the inputs from what **Runner Workflow**
+declares. Agents and step are read at run time. The webhook needs a Header Auth credential, and
+the sender has to be set up in the other system; the mail says so. Anything else the model
+writes itself.
+
+**Its answer is checked**, and a failed check goes back to the model once more with the problems:
+
+- only node types from the allow list; nodes that run commands or unreadable code never,
 - no e-mail address and no UUID in any parameter: those are read from roleALPHA at run time,
-- only credentials already used by managed workflows; a node that stays keeps its own
-  credentials, IDs and webhook IDs,
-- updates and deactivations only of managed workflows, connections only between existing nodes.
+- no expression that reaches `$env`, `$secrets`, `$vars`, `process`, `require` or `constructor`,
+  or reads a node that is not in the workflow,
+- only credentials already used by managed workflows, plus the roleALPHA credential of Propose
+  itself; a node that stays keeps its own credentials, IDs and webhook IDs,
+- updates and deactivations only of managed workflows, connections only between existing nodes,
+- a trigger, and every node connected to it,
+- a sub-workflow call only to a workflow that exists, with inputs it declares,
+- no second workflow with the same name or webhook path, and none for a step another workflow
+  already names.
 
-**Drafts** carry everything Apply needs in a sticky note named `roleALPHA binding`: the action,
+What was approved before stays as it is: a node the model returns unchanged is not checked again.
+
+**Nothing gets lost.** If the model or roleALPHA is away, Propose returns `ok: false, retry: true`
+and *Detect Changes* brings the change back in the next runs, up to five tries in all. What
+cannot be proposed in the end, or fails the check twice, goes by e-mail to the people who decide
+(`Needs attention?` in the example). A later change of an entity replaces its waiting draft;
+the links of the older draft then do nothing.
+
+**Code nodes** are off by default. With **Allow Code Nodes** the model may use them for data
+shaping, and each new or changed one has to pass:
+
+1. **The environment is closed.** With `N8N_BLOCK_ENV_ACCESS_IN_NODE=false` every Code node is
+   refused, because it could read the secrets of the container.
+2. **The code check**, an allow list on the syntax tree: `$input`, `$json`, `$('Node')` of this
+   workflow, and `JSON`, `Math`, `Date`, `Array`, `Object`, `String`, `Number`, `Boolean`,
+   `RegExp`, `Map`, `Set`, `Error`. No `this`, `await`, classes, `$env`, network or modules, no
+   way to `constructor`, and no dynamic keys like `row[key]`: they are the way around any list
+   of forbidden names, and `new Map(Object.entries(row)).get(key)` does the same safely.
+3. **Its own tests.** The model has to deliver test cases, and they run before anyone sees the
+   draft. A failed test goes back to the model.
+4. **A step of its own.** The mail shows the code word for word and goes to the role deciding
+   on `codeGoverningStep`, so it can be a different role than for other changes. Which step
+   applies is read from the draft, not from the link. **Apply Draft** refuses changed code
+   without **Code Approved**, so an older approval workflow fails closed.
+
+The check and the tests are one layer, not a sandbox: run Code nodes in external task runners
+(`N8N_RUNNERS_MODE=external`) with `NODE_FUNCTION_ALLOW_BUILTIN` and
+`NODE_FUNCTION_ALLOW_EXTERNAL` empty. The node can only test code, not run the whole workflow:
+n8n's API has no test run, so read the draft before approving it.
+
+**Drafts** show what they change: `diff` and `reviewHtml` list new, changed and removed nodes and
+connections, and any new code. They carry everything Apply needs in a sticky note named `roleALPHA binding`: the action,
 the target, the target's version and the content hash. **Apply** refuses when the draft no
 longer has the approved hash or the target changed after the draft was made. A managed workflow
 is one with that note and the tag `rolealpha-managed`; nothing else is ever touched.
@@ -218,8 +278,9 @@ once by hand. No data table is needed; *Detect Changes* keeps its cursor in the 
    `approve-workflow-drafts.json`, and pick the credentials on every node that asks for one.
 4. **Fill in Settings** in both workflows: `endpointUrl` and `organisation` of roleALPHA,
    `governingStep`, and in the first one `n8nUrl`, `approvalUrl` (`<n8nUrl>/webhook/rolealpha-workflow-approval`)
-   and `mailFrom`. Adjust **Extra Rules** on *Propose* to your systems and runner; the last
-   rule keeps the builder off its own steps (see [The builder's own steps](#the-builders-own-steps)).
+   and `mailFrom`. On *Propose* set **Runner Workflow** to the name or ID of your runner, and
+   **Extra Rules** to your systems. Without a runner the model gets no templates. In the
+   second workflow also set `governingStep` and `codeGoverningStep`.
 5. **Set up the governing step in roleALPHA**, as described in the next section. Without it
    nobody may approve, and every draft stays a draft.
 6. **Activate** *Approve workflow drafts* first, then *Workflows follow the organisation*. The
@@ -264,15 +325,9 @@ one mail per role.
 
 The builder may be modelled in roleALPHA like any other value chain: a process with the steps
 *detect changes*, *propose a draft* and the governing step, a role responsible for them and an
-agent that fills the role. Its two workflows are not managed (they carry no binding), so for
-the model such a step has no workflow yet. Approving these steps then makes it propose a
-second detect workflow, or not, by chance. Give the builder's steps custom IDs of one prefix,
-e.g. `automation:workflow-detect` and `automation:workflow-propose`, and name the prefix in
-**Extra Rules** of *Propose*. The example workflow already has the rule:
-
-```
-The steps with Custom-ID automation:* are run by the Workflow Builder itself. Never propose a workflow for them.
-```
+agent that fills the role. Give these steps custom IDs of one prefix, e.g.
+`automation:workflow-detect` and `automation:workflow-propose`, and name the prefix in **Own Step
+Prefixes** on *Propose* (default `automation:`). They then never reach the model.
 
 ## Nodes
 
@@ -308,9 +363,10 @@ The steps with Custom-ID automation:* are run by the Workflow Builder itself. Ne
 |---|---|---|
 | Detect Changes | Reads `list_changes` from the cursor kept in the workflow (or the **Cursor** option). Returns `changes` (`created`, `changed`, `removed`, each with `relationships` and the bound `workflows`), `cursor`, `hasMore`, `started`, `checked`, `unreadable` and `skipped`. | MCP OAuth2, n8n API |
 | List Workflows | The managed workflows with their bound entities and the credentials they use. | n8n API |
-| Propose | Needs a chat model on its **Model** input. Returns `ok`, `action` (`create`, `update`, `deactivate`, `none`), `reason`, `workflow`, `contentHash`, `problems` and `notes`. | MCP OAuth2, n8n API |
-| Create Draft | Stores a proposal with `ok = true` as an inactive draft. Returns `draftId` and `contentHash`. | n8n API |
-| Apply Draft | Applies a draft given the approved hash. Optionally activates a new workflow. | n8n API |
+| Propose | Needs a chat model on its **Model** input. Returns `ok`, `action` (`create`, `update`, `deactivate`, `none`), `reason`, `workflow`, `contentHash`, `problems`, `notes`, `decidedBy` (`rule`, `model`, `failed`), and where they apply `rule`, `template`, `code` and `retry`. | MCP OAuth2, n8n API |
+| Create Draft | Stores a proposal with `ok = true` as an inactive draft and replaces an older draft of the same entity. Returns `draftId`, `contentHash`, `diff`, `codeChanged`, `codeNodes`, `reviewHtml` and `replacedDrafts`. | n8n API |
+| Read Draft | What a draft changes against its target: `action`, `contentHash`, `diff`, `codeChanged` and `codeNodes`. | n8n API |
+| Apply Draft | Applies a draft given the approved hash. Optionally activates a new workflow. Refuses changed Code nodes without **Code Approved**. | n8n API |
 | Discard Draft | Deletes a draft; refuses any workflow that is not a draft. | n8n API |
 | Issue Approval Tokens | `approveToken` and `rejectToken` for one person, bound to `draftId` and `contentHash`, plus `tokenExpiresAt`. Keeps the input fields. | Approval Seal API |
 | Verify Approval Token | Returns `draftId`, `contentHash`, `approver`, `decision` and `expiresAt` of a valid token; fails on a changed, foreign or expired one. | Approval Seal API |
@@ -482,7 +538,11 @@ not caught by the graph.
 | `Empty MCP response` | The server answered with no body. Reading calls are repeated; a writing tool is not, so it cannot run twice. |
 | `Cannot access "arguments" due to security concerns` | n8n blocks the name `arguments` in expressions and in `$fromAI`. Name the tool input `toolArgs` or `args`. |
 | Propose returns `ok: false` | The model's answer failed the check twice; `problems` says why. Often a node type outside the allow list or a hard-coded address. Add what the model needs to **Extra Rules**. |
-| Propose drafts a second detect workflow | The builder's own steps are modelled in roleALPHA and the model does not know that the builder runs them. Reject the draft and add the rule from [The builder's own steps](#the-builders-own-steps). |
+| Propose returns `retry: true` | The model or roleALPHA was away. The change comes back in the next run, up to five tries in all. |
+| A template fails with `set Runner Workflow` | **Runner Workflow** on *Propose* is empty or names no workflow. |
+| A Code node is refused with `N8N_BLOCK_ENV_ACCESS_IN_NODE=false` | n8n leaves the environment open to Code nodes. Move what workflows read from `$env` into credentials, then set it to `true`. |
+| `This draft changes Code nodes and was not approved as such` | The approval workflow does not set **Code Approved**. Take *Read Draft* and the check against `codeGoverningStep` from the example. |
+| A step with a frequency never gets a workflow | **Scheduler Covers Frequency** expects a generic scheduler to start it. Switch it off if there is none. |
 | `The draft changed after it was proposed or approved` | Somebody edited the draft, or the link carries another hash. Discard it; the next change proposes again. |
 | `Workflow … changed after the draft was made` | The target was edited after the draft. Discard the draft and let the builder propose again. |
 | Detect fails with `kein Modul für die KI freigegeben` | No module is released for AI in roleALPHA. Release it under *AI settings → data release*. |

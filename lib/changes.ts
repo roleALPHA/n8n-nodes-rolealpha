@@ -317,3 +317,25 @@ export function boundEntities(workflows: Array<{ id: string; entities: string[];
 	}
 	return bound;
 }
+
+/** A proposal that failed for a passing reason (model or roleALPHA away), to try again next run. */
+export interface RetryEntry {
+	change: EntityChange;
+	tries: number;
+}
+
+export const MAX_PROPOSE_TRIES = 5;
+
+/** Failed proposals rejoin the changes of this run; what also changed again keeps its fresh row. */
+export function withRetries(changes: EntityChange[], retry: Record<string, RetryEntry> | undefined): EntityChange[] {
+	const out = [...changes];
+	for (const { change } of Object.values(retry ?? {})) {
+		const fresh = out.find((c) => c.uuid === change.uuid);
+		if (!fresh) out.push(change);
+		else {
+			const seen = new Set(fresh.relationships.map((r) => JSON.stringify(r)));
+			for (const r of change.relationships) if (!seen.has(JSON.stringify(r))) fresh.relationships.push(r);
+		}
+	}
+	return out;
+}

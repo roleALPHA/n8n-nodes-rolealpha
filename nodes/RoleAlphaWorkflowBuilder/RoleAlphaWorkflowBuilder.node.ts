@@ -2,30 +2,39 @@ import type { IDataObject, IExecuteFunctions, INodeExecutionData, INodePropertie
 import { NodeConnectionTypes, NodeOperationError } from 'n8n-workflow';
 import { McpClient, type HttpReply } from '../../lib/mcp';
 import { McpGraphSource } from '../../lib/graph';
-import { boundEntities, detectChanges, ENTITY_TYPES, RUNTIME_RELATIONSHIPS, type EntityChange, type FeedState } from '../../lib/changes';
+import { boundEntities, detectChanges, ENTITY_TYPES, MAX_PROPOSE_TRIES, RUNTIME_RELATIONSHIPS, withRetries, type EntityChange, type FeedState, type RetryEntry } from '../../lib/changes';
 import {
 	affectedWorkflows,
 	applyDraft,
 	buildPlanInput,
+	changedCode,
 	checkPlan,
+	decidedPlan,
 	DEFAULT_NODE_TYPES,
+	diffWorkflows,
 	discardDraft,
 	DRAFT_TAG,
 	draftHash,
 	draftWorkflow,
 	entityContext,
+	findRunner,
 	MANAGED_TAG,
 	N8nApi,
 	parseAnswer,
+	readBinding,
+	reviewHtml,
+	summarizeOthers,
 	summarizeWorkflows,
+	triage,
 	type N8nWorkflow,
 	type PlanCheck,
+	type PlanContext,
 } from '../../lib/workflows';
 import { issueToken, verifyToken } from '../../lib/approvalToken';
 
 const show = (operation: string[]) => ({ show: { operation } });
 const MCP_OPS = ['detectChanges', 'propose'];
-const N8N_OPS = ['detectChanges', 'listWorkflows', 'propose', 'createDraft', 'applyDraft', 'discardDraft'];
+const N8N_OPS = ['detectChanges', 'listWorkflows', 'propose', 'createDraft', 'readDraft', 'applyDraft', 'discardDraft'];
 const TOKEN_OPS = ['issueTokens', 'verifyToken'];
 
 const properties: INodeProperties[] = [
@@ -39,6 +48,7 @@ const properties: INodeProperties[] = [
 			{ name: 'List Workflows', value: 'listWorkflows', action: 'List managed workflows', description: 'The n8n workflows bound to roleALPHA entities, with their credentials' },
 			{ name: 'Propose', value: 'propose', action: 'Propose a workflow change with a model', description: 'Asks the attached model what a change means for the workflows and checks the answer' },
 			{ name: 'Create Draft', value: 'createDraft', action: 'Create an inactive draft from a proposal', description: 'Stores a checked proposal as an inactive draft workflow that waits for approval' },
+			{ name: 'Read Draft', value: 'readDraft', action: 'Read what a draft changes', description: 'Action, target, the changes against the target, and whether Code nodes change, so the approval can go to the right step' },
 			{ name: 'Apply Draft', value: 'applyDraft', action: 'Apply an approved draft', description: 'Creates, updates or deactivates the workflow; refuses if the draft or the target changed' },
 			{ name: 'Discard Draft', value: 'discardDraft', action: 'Discard a rejected draft', description: 'Deletes a draft; refuses anything that is not a draft' },
 			{ name: 'Issue Approval Tokens', value: 'issueTokens', action: 'Issue approve and reject links for one person', description: 'Signed one-time tokens bound to the draft, its hash, the person and the decision' },
@@ -159,6 +169,45 @@ const properties: INodeProperties[] = [
 		description: 'How often the model may answer again after its answer failed the check',
 		displayOptions: show(['propose']),
 	},
+	{
+		displayName: 'Options',
+		name: 'proposeOptions',
+		type: 'collection',
+		placeholder: 'Add Option',
+		default: {},
+		displayOptions: show(['propose']),
+		options: [
+			{
+				displayName: 'Allow Code Nodes',
+				name: 'allowCode',
+				type: 'boolean',
+				default: false,
+				description: 'Whether a proposal may contain Code nodes. Each must pass the code check and its own tests, and needs N8N_BLOCK_ENV_ACCESS_IN_NODE to be on.',
+			},
+			{
+				displayName: 'Own Step Prefixes',
+				name: 'ownStepPrefixes',
+				type: 'string',
+				default: 'automation:',
+				description: 'Comma-separated custom ID prefixes of the steps this builder runs itself; they never get a workflow',
+			},
+			{
+				displayName: 'Runner Workflow',
+				name: 'runnerWorkflow',
+				type: 'string',
+				default: '',
+				placeholder: 'Agent: Runner',
+				description: 'Name or ID of the workflow that runs an agent on a step. Needed for templates; the model also learns its inputs from it.',
+			},
+			{
+				displayName: 'Scheduler Covers Frequency',
+				name: 'schedulerCoversFrequency',
+				type: 'boolean',
+				default: true,
+				description: 'Whether a generic scheduler starts every step by its frequency, so a step with a frequency needs no workflow of its own',
+			},
+		],
+	},
 
 	// ---------------------------------------------------------------- drafts
 	{
@@ -176,7 +225,7 @@ const properties: INodeProperties[] = [
 		type: 'string',
 		default: '',
 		required: true,
-		displayOptions: show(['applyDraft', 'discardDraft', 'issueTokens']),
+		displayOptions: show(['readDraft', 'applyDraft', 'discardDraft', 'issueTokens']),
 	},
 	{
 		displayName: 'Content Hash',
@@ -229,6 +278,14 @@ const properties: INodeProperties[] = [
 		type: 'boolean',
 		default: false,
 		description: 'Whether to activate a new or inactive workflow after applying',
+		displayOptions: show(['applyDraft']),
+	},
+	{
+		displayName: 'Code Approved',
+		name: 'codeApproved',
+		type: 'boolean',
+		default: false,
+		description: 'Whether the approval was checked against the step that governs Code nodes. Without it a draft that changes Code nodes is refused.',
 		displayOptions: show(['applyDraft']),
 	},
 ];
@@ -372,7 +429,10 @@ export class RoleAlphaWorkflowBuilder implements INodeType {
 			if (res.state.recheck) stored.recheck = true;
 			else delete stored.recheck;
 			const { state: _state, ...json } = res;
-			return [[{ json: { ...json, bound: workflows.filter((w) => !w.isDraft).length } as unknown as IDataObject }]];
+			// Proposals that failed for a passing reason come back here until they got an answer.
+			const retry = (this.getWorkflowStaticData('global') as { proposeRetry?: Record<string, RetryEntry> }).proposeRetry;
+			const changes = withRetries(res.changes, retry);
+			return [[{ json: { ...json, changes, retried: changes.length - res.changes.length, bound: workflows.filter((w) => !w.isDraft).length } as unknown as IDataObject }]];
 		}
 
 		if (operation === 'listWorkflows') {
@@ -381,12 +441,22 @@ export class RoleAlphaWorkflowBuilder implements INodeType {
 		}
 
 		let managed: ReturnType<typeof summarizeWorkflows> | undefined;
+		let allWorkflows: N8nWorkflow[] | undefined;
+		const retryStore = this.getWorkflowStaticData('global') as { proposeRetry?: Record<string, RetryEntry> };
+		const setRetry = (uuid: string, entry: RetryEntry | null) => {
+			// Replaced as a whole: n8n only notices a change of the static data itself.
+			const { [uuid]: _old, ...rest } = retryStore.proposeRetry ?? {};
+			const next = entry ? { ...rest, [uuid]: entry } : rest;
+			if (Object.keys(next).length > 0) retryStore.proposeRetry = next;
+			else delete retryStore.proposeRetry;
+		};
 		for (let i = 0; i < items.length; i++) {
 			try {
 				if (operation === 'propose') {
 					const change = asChange(parseJsonParam(this, 'change', i));
 					if (!change) throw new NodeOperationError(this.getNode(), 'Change is not a change from Detect Changes', { itemIndex: i });
-					managed ??= summarizeWorkflows(await api!.listWorkflows(MANAGED_TAG));
+					const model = (await this.getInputConnectionData(NodeConnectionTypes.AiLanguageModel, 0)) as { invoke?: (messages: unknown) => Promise<unknown> } | undefined;
+					if (!model || typeof model.invoke !== 'function') throw new NodeOperationError(this.getNode(), 'Attach a chat model to the Model input', { itemIndex: i });
 					const nodeTypes = String(this.getNodeParameter('nodeTypes', i, '') ?? '')
 						.split(',')
 						.map((t) => t.trim())
@@ -395,44 +465,80 @@ export class RoleAlphaWorkflowBuilder implements INodeType {
 						.split(/\r?\n/)
 						.map((r) => r.trim())
 						.filter(Boolean);
-					const entity = await entityContext(getGraph(i), change);
-					// The feed names no values; name and custom ID come from roleALPHA as it is now.
-					if (change.change !== 'removed') {
-						const d = await getGraph(i).details(change.uuid);
-						change.name = d.name || change.name;
-						change.customId = d.customId ?? change.customId;
-						change.entityType = change.entityType || d.entityType;
-					} else if (!change.name) {
-						change.name = managed.workflows.find((w) => change.workflows.includes(w.id))?.name ?? '';
-					}
-					const ctx = { change, entity, workflows: managed.workflows, affected: affectedWorkflows(change, entity, managed.workflows), credentials: managed.credentials, nodeTypes: nodeTypes.length ? nodeTypes : DEFAULT_NODE_TYPES, extraRules };
-					const input = buildPlanInput(ctx);
-					const model = (await this.getInputConnectionData(NodeConnectionTypes.AiLanguageModel, 0)) as { invoke?: (messages: unknown) => Promise<unknown> } | undefined;
-					if (!model || typeof model.invoke !== 'function') throw new NodeOperationError(this.getNode(), 'Attach a chat model to the Model input', { itemIndex: i });
+					const options = this.getNodeParameter('proposeOptions', i, {}) as IDataObject;
+					const ownPrefixes = String(options.ownStepPrefixes ?? 'automation:')
+						.split(',')
+						.map((p) => p.trim())
+						.filter(Boolean);
 					const attempts = Math.min(5, Math.max(1, Number(this.getNodeParameter('maxAttempts', i, 2)) || 2));
-					const targets = new Map<string, N8nWorkflow>();
-					const messages: Array<[string, string]> = [
-						['system', `${input.systemMessage}\n\nJSON schema of the answer:\n${JSON.stringify(input.schema)}`],
-						['human', input.prompt],
-					];
-					let check: PlanCheck | undefined;
-					let n = 0;
-					while (n < attempts) {
-						n++;
-						const text = answerText(await model.invoke(messages));
-						// For an update, the loaded target keeps node IDs, credentials and webhooks of nodes that stay.
-						const named = (parseAnswer(text) ?? {}) as { targetWorkflowId?: unknown };
-						const targetId = typeof named.targetWorkflowId === 'string' ? named.targetWorkflowId.trim() : '';
-						let existing: N8nWorkflow | null = null;
-						if (targetId && managed.workflows.some((w) => w.id === targetId && !w.isDraft)) {
-							if (!targets.has(targetId)) targets.set(targetId, await api!.get(targetId));
-							existing = targets.get(targetId) ?? null;
+					try {
+						managed ??= summarizeWorkflows(await api!.listWorkflows(MANAGED_TAG));
+						allWorkflows ??= await api!.listWorkflows();
+						const entity = await entityContext(getGraph(i), change);
+						// The feed names no values; name and custom ID come from roleALPHA as it is now.
+						if (change.change !== 'removed') {
+							const d = await getGraph(i).details(change.uuid);
+							change.name = d.name || change.name;
+							change.customId = d.customId ?? change.customId;
+							change.entityType = change.entityType || d.entityType;
+						} else if (!change.name) {
+							change.name = managed.workflows.find((w) => change.workflows.includes(w.id))?.name ?? '';
 						}
-						check = checkPlan(ctx, text, existing);
-						if (check.ok) break;
-						messages.push(['ai', text], ['human', `Your answer failed the check:\n- ${check.problems.join('\n- ')}\nAnswer again with the complete JSON object.`]);
+						const mcp = this.getNode().credentials?.mcpOAuth2Api;
+						const ctx: PlanContext = {
+							change,
+							entity,
+							workflows: managed.workflows,
+							affected: affectedWorkflows(change, entity, managed.workflows),
+							credentials: [...managed.credentials, ...(mcp?.id && !managed.credentials.some((c) => c.type === 'mcpOAuth2Api') ? [{ id: mcp.id, name: mcp.name, type: 'mcpOAuth2Api' }] : [])],
+							nodeTypes: nodeTypes.length ? nodeTypes : DEFAULT_NODE_TYPES,
+							extraRules,
+							others: summarizeOthers(allWorkflows, change.customId),
+							runner: findRunner(allWorkflows, String(options.runnerWorkflow ?? '')),
+							endpointUrl: String(this.getNodeParameter('endpointUrl', i) ?? ''),
+							organisation: organisationAt(i),
+							allowCode: options.allowCode === true,
+							envBlocked: process.env.N8N_BLOCK_ENV_ACCESS_IN_NODE !== 'false',
+						};
+						const decided = triage(ctx, { ownPrefixes, schedulerCoversFrequency: options.schedulerCoversFrequency !== false });
+						if (decided) {
+							setRetry(change.uuid, null);
+							out.push({ json: { ...decidedPlan(change, decided.reason), change, attempts: 0, decidedBy: 'rule', rule: decided.rule } as unknown as IDataObject, pairedItem: { item: i } });
+							continue;
+						}
+						const input = buildPlanInput(ctx);
+						const targets = new Map<string, N8nWorkflow>();
+						const messages: Array<[string, string]> = [
+							['system', `${input.systemMessage}\n\nJSON schema of the answer:\n${JSON.stringify(input.schema)}`],
+							['human', input.prompt],
+						];
+						let check: PlanCheck | undefined;
+						let n = 0;
+						while (n < attempts) {
+							n++;
+							const text = answerText(await model.invoke(messages));
+							// For an update, the loaded target keeps node IDs, credentials and webhooks of nodes that stay.
+							const named = (parseAnswer(text) ?? {}) as { targetWorkflowId?: unknown };
+							const targetId = typeof named.targetWorkflowId === 'string' ? named.targetWorkflowId.trim() : '';
+							let existing: N8nWorkflow | null = null;
+							if (targetId && managed.workflows.some((w) => w.id === targetId && !w.isDraft)) {
+								if (!targets.has(targetId)) targets.set(targetId, await api!.get(targetId));
+								existing = targets.get(targetId) ?? null;
+							}
+							check = checkPlan(ctx, text, existing);
+							if (check.ok) break;
+							messages.push(['ai', text], ['human', `Your answer failed the check:\n- ${check.problems.join('\n- ')}\nAnswer again with the complete JSON object.`]);
+						}
+						setRetry(change.uuid, null);
+						out.push({ json: { ...(check as PlanCheck), change, attempts: n, decidedBy: 'model' } as unknown as IDataObject, pairedItem: { item: i } });
+					} catch (error) {
+						// The model or roleALPHA was away. The cursor has moved on, so the change is kept to try again.
+						const tries = (retryStore.proposeRetry?.[change.uuid]?.tries ?? 0) + 1;
+						const again = tries < MAX_PROPOSE_TRIES;
+						setRetry(change.uuid, again ? { change, tries } : null);
+						const message = `Could not propose (try ${tries} of ${MAX_PROPOSE_TRIES}): ${(error as Error).message}`;
+						out.push({ json: { ...decidedPlan(change, ''), ok: false, problems: [message], change, attempts: 0, decidedBy: 'failed', retry: again } as unknown as IDataObject, pairedItem: { item: i } });
 					}
-					out.push({ json: { ...(check as PlanCheck), change, attempts: n } as unknown as IDataObject, pairedItem: { item: i } });
 					continue;
 				}
 
@@ -448,15 +554,38 @@ export class RoleAlphaWorkflowBuilder implements INodeType {
 					const draftId = String(created.id ?? '');
 					await api!.setTags(draftId, [MANAGED_TAG, DRAFT_TAG]);
 					const { hash } = draftHash(draft);
+					// A newer draft replaces an older one for the same entity; the links of the older one find no draft.
+					const replaced: string[] = [];
+					for (const old of await api!.listWorkflows(DRAFT_TAG)) {
+						if (old.id && old.id !== draftId && readBinding(old)?.draft?.entityUuid === p.entityUuid) {
+							await api!.remove(old.id);
+							replaced.push(old.id);
+						}
+					}
+					const diff = p.action === 'deactivate' ? [`Deactivates workflow "${target?.name ?? p.targetWorkflowId}"`] : diffWorkflows(target, draft);
+					const code = changedCode(draft, target);
 					out.push({
-						json: { draftId, draftName: draft.name, action: p.action, targetWorkflowId: p.targetWorkflowId, entityUuid: p.entityUuid, entityName: change.name, change: change.change, reason: p.reason, notes: p.notes ?? [], contentHash: hash },
+						json: { draftId, draftName: draft.name, action: p.action, targetWorkflowId: p.targetWorkflowId, entityUuid: p.entityUuid, entityName: change.name, change: change.change, reason: p.reason, notes: p.notes ?? [], contentHash: hash, diff, codeChanged: code.length > 0, codeNodes: code.map((c) => c.node), reviewHtml: reviewHtml(diff, code), replacedDrafts: replaced },
+						pairedItem: { item: i },
+					});
+					continue;
+				}
+
+				if (operation === 'readDraft') {
+					const draftId = String(this.getNodeParameter('draftId', i)).trim();
+					const draft = await api!.get(draftId);
+					const { info, hash } = draftHash(draft);
+					const target = info.targetWorkflowId ? await api!.get(info.targetWorkflowId) : null;
+					const code = info.action === 'deactivate' ? [] : changedCode(draft, target);
+					out.push({
+						json: { draftId, action: info.action, targetWorkflowId: info.targetWorkflowId, entityUuid: info.entityUuid, reason: info.reason, contentHash: hash, diff: info.action === 'deactivate' ? [] : diffWorkflows(target, draft), codeChanged: code.length > 0, codeNodes: code.map((c) => c.node) },
 						pairedItem: { item: i },
 					});
 					continue;
 				}
 
 				if (operation === 'applyDraft') {
-					const res = await applyDraft(api!, String(this.getNodeParameter('draftId', i)).trim(), String(this.getNodeParameter('approvedHash', i)).trim(), { activate: this.getNodeParameter('activate', i, false) === true });
+					const res = await applyDraft(api!, String(this.getNodeParameter('draftId', i)).trim(), String(this.getNodeParameter('approvedHash', i)).trim(), { activate: this.getNodeParameter('activate', i, false) === true, codeApproved: this.getNodeParameter('codeApproved', i, false) === true });
 					out.push({ json: res as unknown as IDataObject, pairedItem: { item: i } });
 					continue;
 				}
