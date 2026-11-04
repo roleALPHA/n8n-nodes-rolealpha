@@ -11,7 +11,7 @@
         -460
       ],
       "parameters": {
-        "content": "## Approve workflow drafts\nThe links in the approval e-mail land here. A link carries a **signed one-time token**: it names the draft, the hash of its content, the person and the decision, and it expires. Nobody can change it or make one without the Approval Seal key, so the webhook can be public.\n\n**Opening** the link only shows a page with a button, so mail scanners that open links decide nothing. **The button** sends the token back; then roleALPHA is asked whether that person fills the deciding role of the governing step *right now* (fail-closed). Approve applies the draft only with exactly the content that was sent out, reject deletes it. Either way the draft is gone, so a link works once.",
+        "content": "## Approve workflow drafts\nThe links in the approval e-mail land here. A link carries a **signed one-time token**: it names the draft, the hash of its content, the person and the decision, and it expires. Nobody can change it or make one without the Approval Seal key, so the webhook can be public.\n\n**Opening** the link only shows a page with a button, so mail scanners that open links decide nothing. **The button** sends the token back; then roleALPHA is asked whether that person fills the deciding role of the governing step *right now* (fail-closed). A draft that changes Code nodes is checked against the code governing step instead; this is read from the draft itself, not from the link. Approve applies the draft only with exactly the content that was sent out, reject deletes it. Either way the draft is gone, so a link works once.",
         "width": 640,
         "height": 340
       }
@@ -156,7 +156,7 @@
       "type": "n8n-nodes-base.set",
       "typeVersion": 3.4,
       "position": [
-        460,
+        680,
         200
       ],
       "parameters": {
@@ -180,6 +180,12 @@
               "name": "governingStep",
               "value": "automation:workflow-changes",
               "type": "string"
+            },
+            {
+              "id": "83ffad96-0bf1-59f6-934b-d65650901801",
+              "name": "codeGoverningStep",
+              "value": "automation:workflow-code-changes",
+              "type": "string"
             }
           ]
         },
@@ -192,7 +198,7 @@
       "type": "@rolealpha/n8n-nodes-rolealpha.roleAlpha",
       "typeVersion": 1,
       "position": [
-        680,
+        900,
         200
       ],
       "parameters": {
@@ -200,7 +206,7 @@
         "operation": "checkApprover",
         "endpointUrl": "={{ $('Settings').first().json.endpointUrl }}",
         "organisation": "={{ $('Settings').first().json.organisation }}",
-        "step": "={{ $('Settings').first().json.governingStep }}",
+        "step": "={{ $('Read draft').item.json.codeChanged ? $('Settings').first().json.codeGoverningStep : $('Settings').first().json.governingStep }}",
         "actor": "={{ $('Check link').item.json.approver }}",
         "responsibilityOptions": {}
       },
@@ -217,7 +223,7 @@
       "type": "n8n-nodes-base.if",
       "typeVersion": 2.2,
       "position": [
-        900,
+        1120,
         200
       ],
       "parameters": {
@@ -251,7 +257,7 @@
       "type": "n8n-nodes-base.if",
       "typeVersion": 2.2,
       "position": [
-        1120,
+        1340,
         100
       ],
       "parameters": {
@@ -284,14 +290,15 @@
       "type": "@rolealpha/n8n-nodes-rolealpha.roleAlphaWorkflowBuilder",
       "typeVersion": 1,
       "position": [
-        1340,
+        1560,
         0
       ],
       "parameters": {
         "operation": "applyDraft",
         "draftId": "={{ $('Check link').item.json.draftId }}",
         "approvedHash": "={{ $('Check link').item.json.contentHash }}",
-        "activate": false
+        "activate": false,
+        "codeApproved": "={{ $('Read draft').item.json.codeChanged }}"
       },
       "credentials": {
         "n8nApi": {
@@ -307,7 +314,7 @@
       "type": "@rolealpha/n8n-nodes-rolealpha.roleAlphaWorkflowBuilder",
       "typeVersion": 1,
       "position": [
-        1340,
+        1560,
         200
       ],
       "parameters": {
@@ -328,7 +335,7 @@
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.5,
       "position": [
-        1560,
+        1780,
         100
       ],
       "parameters": {
@@ -343,7 +350,7 @@
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.5,
       "position": [
-        1120,
+        1340,
         360
       ],
       "parameters": {
@@ -352,6 +359,27 @@
         "options": {
           "responseCode": 403
         }
+      }
+    },
+    {
+      "id": "68f82c4b-0fc8-5f41-a0a9-762fb4ad56ec",
+      "name": "Read draft",
+      "type": "@rolealpha/n8n-nodes-rolealpha.roleAlphaWorkflowBuilder",
+      "typeVersion": 1,
+      "position": [
+        460,
+        200
+      ],
+      "credentials": {
+        "n8nApi": {
+          "id": "",
+          "name": "n8n API"
+        }
+      },
+      "onError": "continueErrorOutput",
+      "parameters": {
+        "operation": "readDraft",
+        "draftId": "={{ $('Check link').item.json.draftId }}"
       }
     }
   ],
@@ -400,7 +428,7 @@
       "main": [
         [
           {
-            "node": "Settings",
+            "node": "Read draft",
             "type": "main",
             "index": 0
           }
@@ -488,6 +516,24 @@
         [
           {
             "node": "Done",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read draft": {
+      "main": [
+        [
+          {
+            "node": "Settings",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Not valid",
             "type": "main",
             "index": 0
           }
