@@ -54,7 +54,9 @@ const SUB_TRIGGER = 'n8n-nodes-base.executeWorkflowTrigger';
 const MAX_NODES = 40;
 const STICKY = 'n8n-nodes-base.stickyNote';
 /** What no expression of a model may reach: the environment of n8n and the way out of the expression sandbox. */
-const FORBIDDEN_IN_EXPRESSION = /\$env\b|\$secrets\b|\$vars\b|(?<![.\w$])process\s*[.[]|(?<![.\w$])require\s*\(|\bglobalThis\b|__proto__|\bconstructor\b|(?<![.\w$])eval\s*\(|(?<![.\w$])Function\s*\(/;
+/** This instance over loopback, the containers behind it, and the workflows that lend out a credential. */
+const INTERNAL_ADDRESS = /\bhttps?:\/\/(?:localhost|127(?:\.\d+){3}|0\.0\.0\.0|\[::1?\]|zammad-zammad-[\w-]+)|\/webhook(?:-test)?\/(?:zammad-proxy|kb-quellen)\b/i;
+const FORBIDDEN_IN_EXPRESSION =/\$env\b|\$secrets\b|\$vars\b|(?<![.\w$])process\s*[.[]|(?<![.\w$])require\s*\(|\bglobalThis\b|__proto__|\bconstructor\b|(?<![.\w$])eval\s*\(|(?<![.\w$])Function\s*\(/;
 const EXPRESSION_PART = /\{\{[\s\S]*?\}\}/g;
 const NODE_REFERENCE = /\$\(\s*['"]([^'"]+)['"]\s*\)|\$node\[\s*['"]([^'"]+)['"]\s*\]/g;
 const UUID_ANYWHERE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
@@ -490,6 +492,8 @@ const isExpression = (text: string) => text.includes('{{');
 /** What an expression may not do, and the nodes it reads that are not there. */
 function checkExpressions(node: N8nNode, names: Set<string>, problems: string[], unchanged: boolean): void {
 	eachString(node.parameters, `"${node.name}".parameters`, (text, path) => {
+		const internal = unchanged || node.type === STICKY ? null : INTERNAL_ADDRESS.exec(text);
+		if (internal) problems.push(`${path} calls an internal address (${internal[0]}); those workflows hold credentials that a draft may not borrow`);
 		for (const part of text.match(EXPRESSION_PART) ?? []) {
 			const hit = unchanged ? null : FORBIDDEN_IN_EXPRESSION.exec(part);
 			if (hit) problems.push(`${path} reaches beyond its data (${hit[0]}); read what it needs from nodes instead`);

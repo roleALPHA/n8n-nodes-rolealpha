@@ -205,6 +205,8 @@ writes itself.
 - no e-mail address and no UUID in any parameter: those are read from roleALPHA at run time,
 - no expression that reaches `$env`, `$secrets`, `$vars`, `process`, `require` or `constructor`,
   or reads a node that is not in the workflow,
+- no call to an internal address: this instance over `localhost`, the containers behind it, or the
+  internal workflows `zammad-proxy` and `kb-quellen`, which lend out a credential,
 - only credentials already used by managed workflows, plus the roleALPHA credential of Propose
   itself; a node that stays keeps its own credentials, IDs and webhook IDs,
 - updates and deactivations only of managed workflows, connections only between existing nodes,

@@ -190,6 +190,17 @@ test('A workflow nobody starts, or with a node nothing reaches, is refused', () 
 	assert.equal(checkPlan(ctxOf(), answer([webhook(), sticky])).ok, true, 'a note needs no connection');
 });
 
+test('A draft calls no internal address', () => {
+	const call = (url: string) => answer([webhook(), set('Next', { url })], link('Hook', 'Next'));
+	for (const bad of ['http://localhost:5678/webhook/zammad-proxy', 'http://127.0.0.1:5678/webhook/x', 'http://[::1]:5678/x', 'http://zammad-zammad-nginx-1:8080/api/v1/users', '=https://n8n.example.com/webhook/zammad-proxy', 'https://n8n.example.com/webhook-test/kb-quellen', '={{ $json.base }}/webhook/kb-quellen']) {
+		assert.match(checkPlan(ctxOf(), call(bad)).problems.join(), /calls an internal address/, bad);
+	}
+	assert.equal(checkPlan(ctxOf(), call('https://api.example.com/webhook/orders')).ok, true);
+	assert.equal(checkPlan(ctxOf(), call('the word localhost in a text')).ok, true, 'only an address counts');
+	const note = { name: 'Note', type: 'n8n-nodes-base.stickyNote', typeVersion: 1, position: [0, 0], parameters: { content: 'see http://localhost:5678/webhook/zammad-proxy' } };
+	assert.equal(checkPlan(ctxOf(), answer([webhook(), note])).ok, true, 'a note may mention it');
+});
+
 test('Expressions stay with their data and read existing nodes', () => {
 	const expr = (value: string) => answer([webhook(), set('Next', { value })], link('Hook', 'Next'));
 	for (const bad of ['={{ $env.ZAMMAD_API_TOKEN }}', '={{ process.env.X }}', '={{ $secrets.a }}', '={{ ({}).constructor.constructor("return 1")() }}', 'token {{ $vars.x }}']) {
