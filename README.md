@@ -48,6 +48,9 @@ next run follows. You don't edit code and you don't republish anything.
 - **Workflows that follow the organisation.** When a step is created or changed in roleALPHA,
   or an entity a workflow is bound to changes or is removed, a model proposes what that means for the n8n workflows. The
   proposal becomes an inactive draft, and only a person filling the deciding role can apply it.
+- **Memory that belongs to the role.** What an agent learns is kept for its role, without
+  approval. Give the role to another agent and the memory goes with it. Who decides and who
+  fills a role is never kept: it is read from roleALPHA on every run.
 - **Limits you can change without republishing.** Retries, wait times, run time and tool
   calls come from a settings table and are clamped to fixed bounds.
 
@@ -109,13 +112,16 @@ Scheduler (cron)                        Event router (one webhook)
                           ├ Settings: Resolve               (limits from the settings table)
                           ├ Wait: Check Start               (lease, duplicate-run guard)
                           ├ Share: Build Input → model → Share: Check (cached)
+                          ├ Memory: Select                  (facts of the agent's roles, this step, these records)
                           ├ roleALPHA: Build System Prompt
                           ├ AI Agent (+ data tool limited to the domains of the agent's roles,
-                          │           + roleALPHA: Tool, read only, as the agent)
+                          │           + roleALPHA: Tool, read only, as the agent,
+                          │           + remember → Memory: Check Write → add row)
                           └ Wait: Plan After Run            (done row, wake-ups, lease released)
 
 Scheduler, every tick
  └ Wait: Find Stale Waits → wake (claimed) · remove dead leases · escalate → Get Circle Lead
+ └ Memory: Consolidate    → delete replaced, forgotten and expired facts
 ```
 
 **Every read is the agent's own.** With **Connect As: Agent** the node swaps the function
@@ -331,6 +337,66 @@ agent that fills the role. Give these steps custom IDs of one prefix, e.g.
 `automation:workflow-detect` and `automation:workflow-propose`, and name the prefix in **Own Step
 Prefixes** on *Propose* (default `automation:`). They then never reach the model.
 
+## Memory of roles
+
+An agent that runs every month starts every month from nothing, unless it can keep what it
+learned. Here that memory belongs to the **role**, not to the agent. The agent itself carries
+only identity and technology; its work comes from its roles, and so does what it remembers.
+Give the role *Controlling* to another agent, and the new agent knows what the old one
+learned. An agent that no longer fills a role no longer sees its memory.
+
+```
+Runner
+ ├ data table: Get rows (Agent Memory)
+ ├ Memory: Select          only roles the agent fills now (from its bundle), this step and
+ │                         these records, the newest fact of each topic, within the limits
+ ├ Build System Prompt     Memory = output of Select: rules for remembering, and the facts
+ └ AI Agent
+    └ tool remember        {fact, role?, scope?, topic?, forget?}
+       └ Memory: Check Write → ok: add row · not ok: the reason goes back to the model
+Scheduler
+ └ Memory: Consolidate → delete the rows in remove
+```
+
+**Without approval, so the checks decide.** A fact is kept at once; otherwise memory would be
+of no use in daily work. That is why **Check Write** decides what may be kept at all:
+
+- Only for a role the agent fills in this run, read from its bundle. Circles and roles the
+  agent only reaches through other links do not count, and neither does a role the model
+  names on its own.
+- One short fact per call (500 characters). `scope` is `role` (default), `step` (only on this
+  step) or `records` (only for these records of this step).
+- A `topic` groups facts: a newer fact on the same role, step, records and topic replaces the
+  older one, and `forget` hides the topic. Rows are only ever added; **Consolidate** removes
+  what was replaced, forgotten or has expired, and keeps at most `keepMemoryFacts` per role.
+- Secrets (keys, tokens, passwords) are always refused.
+- **What else is never kept, each company decides** in *What Is Never Kept*, since it runs
+  its own n8n: e-mail addresses, UUIDs, phone numbers and the names of the persons who fill
+  the roles of the step are refused by default. **Blocked Terms** take words such as customer
+  names, matched as whole words in any case; an expression can read them from your CRM.
+  **Blocked Patterns** take regular expressions, e.g. for an IBAN. The guardrails of the agent
+  in roleALPHA still apply: the prompt tells the model not to remember anything they forbid.
+
+**Memory is data.** The prompt lists the facts with role, scope and date as notes from earlier
+runs, not as instructions; guardrails, policies and the current step win. The rules tell the
+model never to remember who decides or fills a role: that is read from roleALPHA on every run.
+Something that should change how a role works is not a fact to remember but a change of the
+role or step, proposed as a draft.
+
+**Setting it up**
+
+1. Create a data table *Agent Memory* with the columns `role_uuid, step_uuid, record_keys,
+   topic, fact, agent_uuid, run_id, at, expires_at`.
+2. In the runner, read the rows (all, or those whose `role_uuid` is one of the agent's
+   roles), run **Memory: Select** and pass its output to **Build System Prompt → Memory**.
+3. Give the AI Agent a tool `remember`: a sub-workflow that gets `fact`, `role`, `scope`,
+   `topic` and `forget` from the model and bundle, step, record keys and run ID from the
+   runner, runs **Memory: Check Write** and adds `row` when `ok` is true. It returns the
+   result, so the model learns why a fact was refused.
+4. In the scheduler, run **Memory: Consolidate** on all rows and delete the rows in `remove`.
+   Pass the role UUIDs that still exist as **Known Role UUIDs** to remove the memory of
+   roles that are gone.
+
 ## Nodes
 
 ### roleALPHA (`roleAlpha`)
@@ -350,12 +416,15 @@ Prefixes** on *Propose* (default `automation:`). They then never reach the model
 | Responsibility | Get Circle Lead | One item per circle of the agent's roles: the role that leads the circle and its holders, e.g. to escalate to. Recognised from a lead flag on the role, else "Lead Link" in its purpose, else a custom ID ending in `:lead`, else the role that decides on or is accountable for the circle. `lead` is null when none is found. | MCP OAuth2 |
 | Responsibility | Get Role Holders | Returns the persons (with address) and agents filling a role. | MCP OAuth2 |
 | Tool | Call Tool / List Tools | Calls one roleALPHA MCP tool from an allow list, e.g. as the read tool of an AI agent. Tool name `list` returns the allowed tools with their arguments; the organisation is added. Errors come back as data, a refused run ends it. | MCP OAuth2 |
-| Prompt | Build System Prompt | Builds the system prompt from the bundle, the step, the duties and the trigger. Everything in the bundle's context that is not a role (OKRs, projects, processes, competences, risks, IT systems, …) goes under *Further context*, with the attributes of its link and each value cut to 1,500 characters; the current step is not listed twice. Event data is passed as data, never as instructions. With a **Share** it adds the agent's part, what is not its part, the rules for waiting within the step, and returns `task` as the user message. | – |
+| Prompt | Build System Prompt | Builds the system prompt from the bundle, the step, the duties and the trigger. Everything in the bundle's context that is not a role (OKRs, projects, processes, competences, risks, IT systems, …) goes under *Further context*, with the attributes of its link and each value cut to 1,500 characters; the current step is not listed twice. Event data is passed as data, never as instructions. With a **Share** it adds the agent's part, what is not its part, the rules for waiting within the step, and returns `task` as the user message. With **Memory** (output of Memory → Select, also when empty) it adds the rules for remembering and what the agent's roles remember. | – |
 | Share | Build Input | Prepares the model call that decides the agent's part of a step: only the accountabilities of its own roles count, the other responsible roles of the step are listed with theirs. Returns `systemMessage`, `prompt` and `schema` for a structured output parser. Needs Get Step with Role Details. | – |
 | Share | Check | Checks the model answer against roleALPHA: drops duties that are no accountability of the agent and needs on roles that are not on the step. Returns `duties` (with `needs`), `notMine`, `waitsFor` and `waitRoleUuids`. | – |
 | Wait | Plan After Run | Decides what follows a run on a step from the stored wait rows: the `done` row to add, which waiting agents of the same step to wake (their awaited role just delivered), which rows to remove, and which waits are stuck at the attempt limit. Covers a result that arrived while the agent was deciding to wait. | – |
 | Wait | Check Start | Duplicate-run guard. After the runner added a lease row for its run (`state = running`), the oldest live lease of the same agent, step and records wins. A later start does not run; it returns a `queueRow` that runs when the busy run ends. Leases older than the run timeout are dead and released. Fail-closed when the own lease is missing. | – |
 | Wait | Find Stale Waits | For a scheduler: waits nobody answered in time (e.g. a person fills the awaited role), queued starts whose busy run died, dead leases, expired rows, and waits at the attempt limit to escalate (`escalate`, reported once). | – |
+| Memory | Check Write | Checks a `remember` call: a role the agent fills (from the bundle), scope, size, secrets, and what the company never keeps. Returns `ok` and the `row` to add, or `error` and `problems` as data. | – |
+| Memory | Select | The facts for the prompt: roles the agent fills now, this step and these records, the newest of each topic, nothing forgotten or expired, within `maxMemoryFacts` and `maxMemoryChars`. Returns `memory` and `omitted`. | – |
+| Memory | Consolidate | For a scheduler: `remove` lists replaced, forgotten and expired rows, rows of roles that are gone (with **Known Role UUIDs**) and rows over `keepMemoryFacts` per role. | – |
 | Settings | Resolve | Runner limits from defaults and a settings table (`scope, target, key, value`): default < global < step < agent. Every value is clamped to fixed bounds; unknown keys and unusable values are reported in `settingProblems` and never applied. | – |
 | Schedule | Is Due | Decides from the step `frequency` (and `termin` / due date) whether a run is due in the current period. | – |
 
@@ -418,6 +487,10 @@ with `scope = global` applies to every run. `step` (target: step UUID or custom 
 | `runTimeoutMinutes` | 15 | 1–120 | A run older than this counts as dead; its lease is released |
 | `escalate` | true | – | Report stuck waits to the role that leads the circle |
 | `shareCacheHours` | 24 | 0–720 | Reuse a share decision while step, roles and trigger kind stay the same (0 = never) |
+| `maxMemoryFacts` | 30 | 0–200 | Remembered facts in one prompt (0 = none) |
+| `maxMemoryChars` | 4000 | 0–20000 | Characters of all remembered facts in one prompt |
+| `memoryTtlDays` | 180 | 1–3650 | Days a remembered fact counts; a shorter value also applies to older facts |
+| `keepMemoryFacts` | 200 | 10–2000 | Facts kept per role in the store (Consolidate) |
 
 A row with a value outside the bounds is clamped and reported. A wrong row can make the
 runner more careful, never unbounded.
@@ -442,6 +515,8 @@ record_keys, event, run_id, attempts, progress, at`.
   change since. The approval link is a signed one-time token for one person and one decision;
   Check Approver decides at use whether that person may still decide.
 - Duplicate runs are blocked by leases, and wake-ups are claimed before they fire.
+- Memory belongs to roles the agent fills in the run; secrets are never kept, and what else is
+  never kept each company sets itself. Remembered facts reach the prompt as data, with limits.
 - No credentials are kept in wait, settings or cache rows. The share cache key holds no
   record content, and a cached answer is checked again like a fresh one.
 

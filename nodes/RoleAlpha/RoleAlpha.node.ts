@@ -29,6 +29,7 @@ import { isDue } from '../../lib/schedule';
 import { buildShareInput, checkShare, SHARE_SCHEMA, type ShareInput, type ShareResult } from '../../lib/share';
 import { checkStart, findStaleWaits, planAfterRun, type FinishedRun, type Limits, type WaitRow } from '../../lib/waits';
 import { DEFAULT_SETTINGS, SETTING_BOUNDS, resolveSettings, type SettingRow } from '../../lib/settings';
+import { checkWrite, compilePatterns, consolidateMemory, selectMemory, type MemoryFact, type MemoryLimits, type MemoryPolicy, type RememberRequest } from '../../lib/memory';
 import { AgentRunError, AgentRunTokens, mcpRefusalCode, type FormPost, type FunctionAccount } from '../../lib/agentRun';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -55,6 +56,7 @@ const properties: INodeProperties[] = [
 		options: [
 			{ name: 'Agent', value: 'agent', description: 'Read an agent\'s context and list the agents of the organisation' },
 			{ name: 'Responsibility', value: 'responsibility', description: 'Traverse roles, steps and deciders' },
+			{ name: 'Memory', value: 'memory', description: 'What the agent\'s roles remember from earlier runs: check a fact, pick facts for the prompt, clean up' },
 			{ name: 'Prompt', value: 'prompt', description: 'Build a system prompt from roleALPHA data' },
 			{ name: 'Schedule', value: 'schedule', description: 'Decide whether a step is due' },
 			{ name: 'Settings', value: 'settings', description: 'Runner limits from defaults and a settings table (global, step, agent)' },
@@ -374,6 +376,14 @@ const properties: INodeProperties[] = [
 		displayOptions: show('prompt', ['buildSystemPrompt']),
 	},
 	{
+		displayName: 'Memory',
+		name: 'memory',
+		type: 'json',
+		default: '',
+		description: 'Output of Memory → Select (optional). Set it, even empty, when the agent has the remember tool: it adds the rules for remembering and what the roles remember.',
+		displayOptions: show('prompt', ['buildSystemPrompt']),
+	},
+	{
 		displayName: 'Additional Rules',
 		name: 'extraRules',
 		type: 'string',
@@ -475,6 +485,104 @@ const properties: INodeProperties[] = [
 			{ displayName: 'Keep Done Rows (Hours)', name: 'keepDoneHours', type: 'number', typeOptions: { minValue: 1 }, default: 168 },
 			{ displayName: 'Older Than (Minutes)', name: 'olderThanMinutes', type: 'number', typeOptions: { minValue: 1 }, default: 60, description: 'Find Stale Waits: only waits at least this old' },
 			{ displayName: 'Run Timeout (Minutes)', name: 'runTimeoutMinutes', type: 'number', typeOptions: { minValue: 1 }, default: 15, description: 'Leases older than this count as dead' },
+		],
+	},
+
+	// ---------------------------------------------------------------- memory
+	{
+		displayName: 'Operation',
+		name: 'operation',
+		type: 'options',
+		noDataExpression: true,
+		displayOptions: { show: { resource: ['memory'] } },
+		options: [
+			{ name: 'Check Write', value: 'checkWrite', action: 'Check a fact to remember', description: 'Checks a remember call of the agent and returns the row to add, or the reason it is not kept' },
+			{ name: 'Select', value: 'select', action: 'Pick what the roles remember', description: 'The facts of the roles the agent fills now, for this step and these records, within the limits' },
+			{ name: 'Consolidate', value: 'consolidate', action: 'Clean up the memory', description: 'For a scheduler: rows to delete (expired, replaced, forgotten, over the limit per role)' },
+		],
+		default: 'checkWrite',
+	},
+	{
+		displayName: 'Rows',
+		name: 'rows',
+		type: 'json',
+		default: '={{ $input.all().map(item => item.json) }}',
+		description: 'Stored memory rows (role_uuid, step_uuid, record_keys, topic, fact, agent_uuid, run_id, at, expires_at)',
+		displayOptions: show('memory', ['select', 'consolidate']),
+	},
+	{
+		displayName: 'Context Bundle',
+		name: 'bundle',
+		type: 'json',
+		default: '',
+		required: true,
+		description: 'Output of Agent → Get Context of this run. Only the roles the agent fills there count.',
+		displayOptions: show('memory', ['checkWrite', 'select']),
+	},
+	{
+		displayName: 'Step',
+		name: 'stepJson',
+		type: 'json',
+		default: '',
+		description: 'Output of Responsibility → Get Step (optional). With holders, their names are not kept.',
+		displayOptions: show('memory', ['checkWrite', 'select']),
+	},
+	{
+		displayName: 'Record Keys',
+		name: 'recordKeys',
+		type: 'string',
+		default: '',
+		description: 'Keys of the records this run works on, comma-separated (optional)',
+		displayOptions: show('memory', ['checkWrite', 'select']),
+	},
+	{
+		displayName: 'Run ID',
+		name: 'memoryRunId',
+		type: 'string',
+		default: '',
+		displayOptions: show('memory', ['checkWrite']),
+	},
+	{
+		displayName: 'Remember Call',
+		name: 'request',
+		type: 'json',
+		default: '',
+		required: true,
+		placeholder: '{"fact":"","role":"","scope":"role","topic":""}',
+		description: 'What the model passed to the remember tool: fact, role (optional), scope (role, step, records), topic (optional), forget (optional)',
+		displayOptions: show('memory', ['checkWrite']),
+	},
+	{
+		displayName: 'Known Role UUIDs',
+		name: 'knownRoles',
+		type: 'string',
+		default: '',
+		description: 'Optional: the roles that still exist (comma-separated or an array). Facts of other roles are removed.',
+		displayOptions: show('memory', ['consolidate']),
+	},
+	{
+		displayName: 'Settings Rows',
+		name: 'settingRows',
+		type: 'json',
+		default: '',
+		description: 'Optional rows of the settings table: maxMemoryFacts, maxMemoryChars, memoryTtlDays, keepMemoryFacts (global < step < agent)',
+		displayOptions: { show: { resource: ['memory'] } },
+	},
+	{
+		displayName: 'What Is Never Kept',
+		name: 'memoryPolicy',
+		type: 'collection',
+		placeholder: 'Add Option',
+		default: {},
+		description: 'Your company decides. Secrets are always refused.',
+		displayOptions: show('memory', ['checkWrite']),
+		options: [
+			{ displayName: 'Block E-Mail Addresses', name: 'blockEmails', type: 'boolean', default: true },
+			{ displayName: 'Block UUIDs', name: 'blockUuids', type: 'boolean', default: true },
+			{ displayName: 'Block Phone Numbers', name: 'blockPhoneNumbers', type: 'boolean', default: true },
+			{ displayName: 'Block Names of Role Holders', name: 'blockPersonNames', type: 'boolean', default: true, description: 'Whether names of the persons who fill the roles of the step are refused (needs Step with holders)' },
+			{ displayName: 'Blocked Terms', name: 'blockedTerms', type: 'string', typeOptions: { rows: 4 }, default: '', description: 'One term per line (or comma-separated), matched as a whole word in any case, e.g. customer names read from your CRM with an expression' },
+			{ displayName: 'Blocked Patterns', name: 'blockedPatterns', type: 'string', typeOptions: { rows: 3 }, default: '', description: 'One regular expression per line, e.g. for an IBAN' },
 		],
 	},
 
@@ -609,6 +717,24 @@ const properties: INodeProperties[] = [
 ];
 
 // -------------------------------------------------------------------- helpers
+
+function bundleParam(ctx: IExecuteFunctions, i: number): ContextBundle {
+	const raw = parseJsonParam(ctx, 'bundle', i) as IDataObject | undefined;
+	const bundle = (raw && typeof raw.bundle === 'object' ? raw.bundle : raw) as unknown as ContextBundle;
+	if (!bundle || !bundle.agent) throw new NodeOperationError(ctx.getNode(), 'Context Bundle has no agent', { itemIndex: i });
+	return { ...bundle, guardrails: bundle.guardrails ?? [], context: bundle.context ?? [] };
+}
+
+function stepParamJson(ctx: IExecuteFunctions, i: number): Step | null {
+	const raw = parseJsonParam(ctx, 'stepJson', i) as IDataObject | undefined;
+	const step = (raw && typeof raw.step === 'object' ? raw.step : raw) as Step | undefined;
+	return step && typeof step === 'object' && step.uuid ? step : null;
+}
+
+function memoryLimits(rows: SettingRow[], bundle: ContextBundle, step: Step | null): MemoryLimits {
+	const s = resolveSettings(rows, { agentUuid: bundle.agent?.uuid ?? '', stepUuid: step?.uuid ?? '', stepCustomId: step?.customId ?? '' }).settings;
+	return { maxFacts: s.maxMemoryFacts, maxChars: s.maxMemoryChars, ttlDays: s.memoryTtlDays, keepFacts: s.keepMemoryFacts };
+}
 
 function parseJsonParam(ctx: IExecuteFunctions, name: string, i: number): unknown {
 	const value = ctx.getNodeParameter(name, i, '') as unknown;
@@ -902,8 +1028,62 @@ export class RoleAlpha implements INodeType {
 			return [[{ json: plan as unknown as IDataObject }]];
 		}
 
+		// Memory: Select and Consolidate look at all stored rows at once.
+		if (resource === 'memory' && operation !== 'checkWrite') {
+			const rows = parseJsonParam(this, 'rows', 0);
+			const settingRowsRaw = parseJsonParam(this, 'settingRows', 0);
+			const settingRows = (Array.isArray(settingRowsRaw) ? settingRowsRaw : []) as SettingRow[];
+			if (operation === 'consolidate') {
+				const s = resolveSettings(settingRows).settings;
+				const knownRaw = this.getNodeParameter('knownRoles', 0, '') as unknown;
+				const known = (Array.isArray(knownRaw) ? knownRaw : String(knownRaw ?? '').split(',')).map((v) => String(v).trim()).filter(Boolean);
+				const res = consolidateMemory(rows, { limits: { ttlDays: s.memoryTtlDays, keepFacts: s.keepMemoryFacts }, knownRoleUuids: known });
+				return [[{ json: res as unknown as IDataObject }]];
+			}
+			const bundle = bundleParam(this, 0);
+			const step = stepParamJson(this, 0);
+			const limits = memoryLimits(settingRows, bundle, step);
+			const res = selectMemory(rows, { bundle, stepUuid: step?.uuid ?? null, recordKeys: this.getNodeParameter('recordKeys', 0, ''), limits });
+			return [[{ json: res as unknown as IDataObject }]];
+		}
+
 		for (let i = 0; i < items.length; i++) {
 			try {
+				if (resource === 'memory') {
+					const bundle = bundleParam(this, i);
+					const step = stepParamJson(this, i);
+					const settingRowsRaw = parseJsonParam(this, 'settingRows', i);
+					const limits = memoryLimits((Array.isArray(settingRowsRaw) ? settingRowsRaw : []) as SettingRow[], bundle, step);
+					const raw = parseJsonParam(this, 'request', i) as unknown;
+					const request = (raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}) as RememberRequest;
+					const opts = this.getNodeParameter('memoryPolicy', i, {}) as IDataObject;
+					const lines = (v: unknown, split: RegExp) => String(v ?? '').split(split).map((t) => t.trim()).filter(Boolean);
+					const policy: MemoryPolicy = {
+						blockEmails: opts.blockEmails !== false,
+						blockUuids: opts.blockUuids !== false,
+						blockPhoneNumbers: opts.blockPhoneNumbers !== false,
+						blockPersonNames: opts.blockPersonNames !== false,
+						blockedTerms: lines(opts.blockedTerms, /\r?\n|,/),
+						blockedPatterns: lines(opts.blockedPatterns, /\r?\n/),
+					};
+					try {
+						compilePatterns(policy.blockedPatterns);
+					} catch (error) {
+						throw new NodeOperationError(this.getNode(), (error as Error).message, { itemIndex: i });
+					}
+					const res = checkWrite(request, {
+						bundle,
+						step,
+						recordKeys: this.getNodeParameter('recordKeys', i, ''),
+						runId: String(this.getNodeParameter('memoryRunId', i, '') ?? ''),
+						ttlDays: limits.ttlDays,
+						policy,
+					});
+					// A refusal is data, so the model can shorten or rephrase the fact.
+					out.push({ json: res as unknown as IDataObject, pairedItem: { item: i } });
+					continue;
+				}
+
 				if (resource === 'agent') {
 					const agentUuid = this.getNodeParameter('agentUuid', i) as string;
 					if (operation === 'getContextVersion') {
@@ -986,6 +1166,12 @@ export class RoleAlpha implements INodeType {
 					const duties = parseJsonParam(this, 'duties', i);
 					const shareRaw = parseJsonParam(this, 'share', i) as IDataObject | undefined;
 					const share = (shareRaw && Array.isArray(shareRaw.duties) ? shareRaw : null) as unknown as ShareResult | null;
+					const memoryRaw = parseJsonParam(this, 'memory', i) as unknown;
+					const memory = Array.isArray(memoryRaw)
+						? (memoryRaw as MemoryFact[])
+						: memoryRaw && typeof memoryRaw === 'object' && Array.isArray((memoryRaw as IDataObject).memory)
+							? ((memoryRaw as IDataObject).memory as unknown as MemoryFact[])
+							: null;
 					const rules = String(this.getNodeParameter('extraRules', i, '') ?? '')
 						.split(/\r?\n/)
 						.map((r) => r.trim())
@@ -997,6 +1183,7 @@ export class RoleAlpha implements INodeType {
 						trigger: { type: (this.getNodeParameter('triggerType', i, '') as string) || undefined, event: parseJsonParam(this, 'event', i) },
 						extraRules: rules,
 						share,
+						memory,
 					});
 					const json: IDataObject = { ...items[i].json, systemPrompt };
 					if (share && step) json.task = buildTask({ step, share, triggerType: (this.getNodeParameter('triggerType', i, '') as string) || undefined });
