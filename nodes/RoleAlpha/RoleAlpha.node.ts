@@ -45,6 +45,7 @@ import {
 	type PageWrite,
 } from '../../lib/knowledge';
 import { AgentRunError, AgentRunTokens, mcpRefusalCode, type FormPost, type FunctionAccount } from '../../lib/agentRun';
+import { costOf, priceTableFromRows, type Priced } from '../../lib/pricing';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -92,6 +93,7 @@ const properties: INodeProperties[] = [
 			{ name: 'Get Context', value: 'getContext', action: 'Get the context of an agent', description: 'Identity, roles and guardrails of one agent' },
 			{ name: 'Get Context Version', value: 'getContextVersion', action: 'Get the context version of an agent', description: 'Change check; cheap and not audited with agent keys' },
 			{ name: 'List Agents', value: 'listAgents', action: 'List agents', description: 'One item per agent of the organisation (MCP) or per key in the credential' },
+			{ name: 'Report Usage', value: 'reportUsage', action: 'Report the usage of a run', description: 'Reports what this run consumed (tokens, model, cost) with the function account, for the agent\'s budget in roleALPHA. The cost comes from your price rows; roleALPHA does not price runs.' },
 			{ name: 'Start Run', value: 'startRun', action: 'Start a run as an agent', description: 'Swaps the function account token for a run token of the agent (agent:run). A refusal comes back as data with its code.' },
 		],
 		default: 'getContext',
@@ -183,7 +185,7 @@ const properties: INodeProperties[] = [
 		name: 'connectAs',
 		type: 'options',
 		noDataExpression: true,
-		displayOptions: { show: { resource: ['agent', 'responsibility', 'tool'] }, hide: { source: ['agentKey'], operation: ['startRun', 'listAgents'] } },
+		displayOptions: { show: { resource: ['agent', 'responsibility', 'tool'] }, hide: { source: ['agentKey'], operation: ['startRun', 'reportUsage', 'listAgents'] } },
 		options: [
 			{ name: 'Function Account', value: 'account', description: 'The view of the connection itself' },
 			{ name: 'Agent (Run Token)', value: 'agent', description: 'Exactly the view of the agent of this run (needs agent:run and a function account with client credentials)' },
@@ -197,7 +199,7 @@ const properties: INodeProperties[] = [
 		default: '',
 		required: true,
 		description: 'The agent this run acts as',
-		displayOptions: { show: { resource: ['agent', 'responsibility', 'tool'], connectAs: ['agent'] }, hide: { source: ['agentKey'], operation: ['startRun', 'listAgents'] } },
+		displayOptions: { show: { resource: ['agent', 'responsibility', 'tool'], connectAs: ['agent'] }, hide: { source: ['agentKey'], operation: ['startRun', 'reportUsage', 'listAgents'] } },
 	},
 	{
 		displayName: 'Run Agent UUID',
@@ -206,7 +208,7 @@ const properties: INodeProperties[] = [
 		default: '',
 		required: true,
 		description: 'The agent this run acts as',
-		displayOptions: show('agent', ['startRun']),
+		displayOptions: show('agent', ['startRun', 'reportUsage']),
 	},
 	{
 		displayName: 'Run ID',
@@ -214,7 +216,7 @@ const properties: INodeProperties[] = [
 		type: 'string',
 		default: '={{ $execution.id }}',
 		description: 'Names the run in every audit entry; 1-128 characters of A-Z a-z 0-9 . _ : -. Sub-workflows of the run pass the same ID.',
-		displayOptions: { show: { resource: ['agent', 'responsibility', 'tool'], connectAs: ['agent'] }, hide: { source: ['agentKey'], operation: ['startRun', 'listAgents'] } },
+		displayOptions: { show: { resource: ['agent', 'responsibility', 'tool'], connectAs: ['agent'] }, hide: { source: ['agentKey'], operation: ['startRun', 'reportUsage', 'listAgents'] } },
 	},
 	{
 		displayName: 'Run ID',
@@ -222,7 +224,70 @@ const properties: INodeProperties[] = [
 		type: 'string',
 		default: '={{ $execution.id }}',
 		description: 'Names the run in every audit entry; 1-128 characters of A-Z a-z 0-9 . _ : -. Sub-workflows of the run pass the same ID.',
-		displayOptions: show('agent', ['startRun']),
+		displayOptions: show('agent', ['startRun', 'reportUsage']),
+	},
+	{
+		displayName: 'Model',
+		name: 'usageModel',
+		type: 'string',
+		default: '',
+		description: 'The model the run used, e.g. from the chat model node. Looked up in the price rows.',
+		displayOptions: show('agent', ['reportUsage']),
+	},
+	{
+		displayName: 'Input Tokens',
+		name: 'usageInputTokens',
+		type: 'string',
+		default: '',
+		description: 'Uncached input tokens of the whole run',
+		displayOptions: show('agent', ['reportUsage']),
+	},
+	{
+		displayName: 'Output Tokens',
+		name: 'usageOutputTokens',
+		type: 'string',
+		default: '',
+		description: 'Output tokens of the whole run',
+		displayOptions: show('agent', ['reportUsage']),
+	},
+	{
+		displayName: 'Cache Read Tokens',
+		name: 'usageCacheReadTokens',
+		type: 'string',
+		default: '',
+		displayOptions: show('agent', ['reportUsage']),
+	},
+	{
+		displayName: 'Cache Write Tokens',
+		name: 'usageCacheWriteTokens',
+		type: 'string',
+		default: '',
+		displayOptions: show('agent', ['reportUsage']),
+	},
+	{
+		displayName: 'Price Rows',
+		name: 'priceRows',
+		type: 'json',
+		default: '',
+		placeholder: '[{"model":"claude-opus-5-5","input":4,"cacheRead":0.4,"cacheWrite":5,"output":20,"currency":"USD","asOf":"2026-11-20"}]',
+		description: 'Your prices per million tokens, one row per model (e.g. all rows of a data table). With your own AI key only you know them; roleALPHA does not price runs. Without a matching row the run is reported with tokens only and counts as "without a price".',
+		displayOptions: show('agent', ['reportUsage']),
+	},
+	{
+		displayName: 'Cost',
+		name: 'usageCost',
+		type: 'string',
+		default: '',
+		description: 'Optional: the cost of the run if the workflow already knows it. Overrides the price rows.',
+		displayOptions: show('agent', ['reportUsage']),
+	},
+	{
+		displayName: 'Currency',
+		name: 'usageCurrency',
+		type: 'string',
+		default: 'USD',
+		description: 'ISO code of Cost, e.g. USD',
+		displayOptions: show('agent', ['reportUsage']),
 	},
 	{
 		displayName: 'MCP Endpoint URL',
@@ -1068,6 +1133,54 @@ export class RoleAlpha implements INodeType {
 			} catch (error) {
 				throw new NodeOperationError(this.getNode(), `roleALPHA Agent Keys: ${(error as Error).message}`);
 			}
+		}
+
+		// Reporting a run's usage: with the function account, never the run token (agentRun.ts).
+		if (resource === 'agent' && operation === 'reportUsage') {
+			if (source === 'agentKey') throw new NodeOperationError(this.getNode(), 'Report Usage needs a function account (source MCP), not agent keys');
+			const tokens = new AgentRunTokens(formPost(this));
+			const account = await functionAccount(this);
+			for (let i = 0; i < items.length; i++) {
+				const count = (name: string): number | undefined => {
+					const v = String(this.getNodeParameter(name, i, '') ?? '').trim();
+					if (v === '') return undefined;
+					const n = Number(v.replace(',', '.'));
+					if (!Number.isFinite(n) || n < 0) throw new NodeOperationError(this.getNode(), `"${name}" is not a number ≥ 0`, { itemIndex: i });
+					return n;
+				};
+				const agentUuid = String(this.getNodeParameter('runAgentUuid', i, '') ?? '').trim().toLowerCase();
+				const runId = String(this.getNodeParameter('runId', i, '') ?? '').trim();
+				const model = String(this.getNodeParameter('usageModel', i, '') ?? '').trim() || undefined;
+				const usage = {
+					inputTokens: count('usageInputTokens'),
+					cacheReadTokens: count('usageCacheReadTokens'),
+					cacheWriteTokens: count('usageCacheWriteTokens'),
+					outputTokens: count('usageOutputTokens'),
+				};
+				const cost = count('usageCost');
+				let priced: Priced | { cost: number; currency: string; priceKind: 'tabelle'; priceSource: string } | null = null;
+				if (cost !== undefined) {
+					priced = { cost, currency: String(this.getNodeParameter('usageCurrency', i, 'USD') ?? 'USD').trim().toUpperCase(), priceKind: 'tabelle', priceSource: 'workflow' };
+				} else {
+					const rows = parseJsonParam(this, 'priceRows', i);
+					if (Array.isArray(rows) && rows.length > 0) {
+						try {
+							priced = costOf(usage, model, priceTableFromRows(rows as Array<Record<string, unknown>>));
+						} catch (error) {
+							throw new NodeOperationError(this.getNode(), (error as Error).message, { itemIndex: i });
+						}
+					}
+				}
+				try {
+					const receipt = await tokens.reportUsage(account, { agentUuid, runId, model, ...usage, ...(priced ?? {}) }, tokens.usageUrlFor(account, agentUuid, runId));
+					out.push({ json: { ...items[i].json, usage: { reported: true, ...receipt, cost: priced?.cost ?? null, currency: priced?.currency ?? null } } as unknown as IDataObject, pairedItem: { item: i } });
+				} catch (error) {
+					if (!(error instanceof AgentRunError)) throw error;
+					// A refusal comes back as data: reporting must never break the run it reports.
+					out.push({ json: { ...items[i].json, usage: { reported: false, code: error.code, reaction: error.reaction, reason: error.description } } as unknown as IDataObject, pairedItem: { item: i } });
+				}
+			}
+			return [out];
 		}
 
 		// Acting as an agent: every MCP call of this node runs under the run token of that agent.
