@@ -22,6 +22,14 @@ export interface RunnerSettings {
 	escalate: boolean;
 	/** Hours a share decision is reused while step, roles and trigger stay the same; 0 = never. */
 	shareCacheHours: number;
+	/** Facts of the roles' memory that go into one prompt. */
+	maxMemoryFacts: number;
+	/** Characters of all remembered facts in one prompt. */
+	maxMemoryChars: number;
+	/** Days a remembered fact counts. */
+	memoryTtlDays: number;
+	/** Facts kept per role in the memory store. */
+	keepMemoryFacts: number;
 }
 
 export type SettingKey = keyof RunnerSettings;
@@ -34,6 +42,10 @@ export const DEFAULT_SETTINGS: RunnerSettings = {
 	runTimeoutMinutes: 15,
 	escalate: true,
 	shareCacheHours: 24,
+	maxMemoryFacts: 30,
+	maxMemoryChars: 4000,
+	memoryTtlDays: 180,
+	keepMemoryFacts: 200,
 };
 
 export const SETTING_BOUNDS: Record<Exclude<SettingKey, 'escalate'>, { min: number; max: number }> = {
@@ -43,6 +55,10 @@ export const SETTING_BOUNDS: Record<Exclude<SettingKey, 'escalate'>, { min: numb
 	maxIterations: { min: 1, max: 50 },
 	runTimeoutMinutes: { min: 1, max: 120 },
 	shareCacheHours: { min: 0, max: 720 },
+	maxMemoryFacts: { min: 0, max: 200 },
+	maxMemoryChars: { min: 0, max: 20000 },
+	memoryTtlDays: { min: 1, max: 3650 },
+	keepMemoryFacts: { min: 10, max: 2000 },
 };
 
 export interface SettingRow {
