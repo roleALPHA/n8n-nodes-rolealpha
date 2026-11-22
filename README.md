@@ -125,6 +125,7 @@ Scheduler (cron)                        Event router (one webhook)
                           │           + roleALPHA: Tool, read only, as the agent,
                           │           + remember → Memory: Check Write → add row,
                           │                        or → read page → Memory: Write Page → store page)
+                          ├ roleALPHA: Report Usage         (tokens, model, cost of this run → agent budget)
                           └ Wait: Plan After Run            (done row, wake-ups, lease released)
 
 Scheduler, every tick
@@ -139,6 +140,20 @@ Context, step, roles and the read tool of the model then see exactly what the ag
 see, without admin rights and without a key per agent in n8n. **Start Run** swaps first and
 returns a refusal as data (`code`, `reaction`): an agent that is paused, over budget or not
 bound to the account does not run. There is no fallback to the view of the account.
+
+**The run reports what it consumed.** **Report Usage** sends the tokens, the model and the cost of
+this run to roleALPHA, for the budget of the agent: once the budget of the period is used up, the
+next **Start Run** is refused with `agent_budget_erschoepft`. It reports with the function account,
+not the run token, so the run that used the budget up still gets through. Report the totals of the
+run; reporting the same run again replaces the previous report.
+
+**The cost is yours to calculate.** With your own AI key the price depends on your contract, so
+roleALPHA does not price runs. Pass your prices as **Price Rows** (one row per model, per million
+tokens: `model, input, cacheRead, cacheWrite, output, currency, asOf` — e.g. all rows of a data
+table). A model without a row is reported with tokens only and counts as "without a price" in
+roleALPHA, never as 0. Only reports in the tenant's budget currency (USD by default) count
+against the budget. A refusal comes back as data (`usage.reported: false`, `code`, `reaction`);
+`stopReporting` means demand planning is not enabled in the organisation.
 
 Approval gates follow this order: **Get Decider → Check Approver → Approval Seal: Sign**. The
 workflow that sends runs **Approval Seal: Verify** first and stops if the content changed.
@@ -536,6 +551,7 @@ Select Pages again with all of them.
 |---|---|---|---|
 | Agent | Get Context | Reads an agent's context bundle (identity, roles, guardrails). Fails if the agent is not `active` or has no policy, unless you switch that off. Over MCP it reads the `agent` view by default, exactly what the agent gets over its own key. | MCP OAuth2 (default) or roleALPHA Agent Keys API |
 | Agent | Get Context Version | Change check. Cheap and not audited with agent keys; over MCP it reads the bundle. | MCP OAuth2 or roleALPHA Agent Keys API |
+| Agent | Report Usage | Reports the tokens, model and cost of this run for the agent's budget, with the function account. The cost comes from your **Price Rows** (or **Cost**); without a matching row only tokens are sent. Returns `usage` with `reported`, `counted`, `period`, or `code` and `reaction` of the refusal. | MCP OAuth2 with client credentials |
 | Agent | Start Run | Swaps the function account token for a run token of the agent (`agent:run`). Returns `started`, or `code` and `reaction` of the refusal (`pause`, `pauseUntilNextPeriod`, `informAdmin`, `retryLater`, …). The token never appears in the output. | MCP OAuth2 with client credentials |
 | Agent | List Agents | Over MCP: every agent of the organisation, paged. With agent keys: one item per key. By default it skips agents that are not active. | MCP OAuth2 or roleALPHA Agent Keys API |
 | Responsibility | Get Duties | Lists the steps the agent's roles are `RESPONSIBLE_FOR`, with the circle. | MCP OAuth2 |

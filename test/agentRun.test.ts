@@ -103,3 +103,59 @@ test('agent run: refusal codes of the MCP endpoint and unknown codes', () => {
 	assert.equal(reactionFor('neuer_code', 503), 'retryLater');
 	assert.equal(reactionFor('neuer_code', 403), 'endRun');
 });
+
+const USAGE_URL = 'https://ra.test/api/agent-lauf/verbrauch';
+
+test('usage: reported with the ACCOUNT token to the usage_url of the exchange; one run, its totals', async () => {
+	const s = fakeServer([
+		() => ok({ access_token: 'acct', expires_in: 3600 }),
+		() => ok({ access_token: 'run-1', expires_in: 900, usage_url: USAGE_URL }),
+		() => ok({ run_id: 'exec-1', period_year: 2026, period: '2026-11', counted: true, budget_currency: 'USD' }),
+	]);
+	const urls: string[] = [];
+	const post = async (url: string, form: Record<string, string>, headers: Record<string, string>) => { urls.push(url); return s.post(url, form, headers); };
+	const tokens = new AgentRunTokens(post, () => 0, freshStore());
+	const run = await tokens.runToken(ACCOUNT, AGENT, 'exec-1');
+	assert.equal(run.usageUrl, USAGE_URL);
+	const r = await tokens.reportUsage(ACCOUNT, { agentUuid: AGENT, runId: 'exec-1', model: 'claude-opus-5-5', inputTokens: 1000, outputTokens: 200, cost: 0.12, currency: 'USD', priceKind: 'tabelle', priceSource: 'runner-tabelle 2026-11-20' }, run.usageUrl);
+	assert.deepEqual(r, { runId: 'exec-1', periodYear: 2026, period: '2026-11', counted: true, budgetCurrency: 'USD' });
+	assert.equal(urls[2], USAGE_URL);
+	assert.equal(s.calls[2].headers.Authorization, 'Bearer acct', 'the account token, not the run token');
+	assert.deepEqual(s.calls[2].form, { agent_uuid: AGENT, run_id: 'exec-1', model: 'claude-opus-5-5', input_tokens: '1000', output_tokens: '200', cost: '0.12', currency: 'USD', price_kind: 'tabelle', price_source: 'runner-tabelle 2026-11-20' });
+});
+
+test('usage: without a cost only tokens go out; without usage_url the path next to the token endpoint', async () => {
+	const s = fakeServer([() => ok({ access_token: 'acct', expires_in: 3600 }), () => ok({ run_id: 'r', period_year: 2026, period: '2026-11', counted: false, budget_currency: 'USD' })]);
+	const urls: string[] = [];
+	const post = async (url: string, form: Record<string, string>, headers: Record<string, string>) => { urls.push(url); return s.post(url, form, headers); };
+	const r = await new AgentRunTokens(post, () => 0, freshStore()).reportUsage(ACCOUNT, { agentUuid: AGENT, runId: 'r', model: 'gpt-x', inputTokens: 10 });
+	assert.equal(r.counted, false);
+	assert.equal(urls[1], 'https://ra.test/api/agent-lauf/verbrauch');
+	assert.deepEqual(s.calls[1].form, { agent_uuid: AGENT, run_id: 'r', model: 'gpt-x', input_tokens: '10' });
+});
+
+test('usage: a stale account token is renewed once; other refusals carry their reaction', async () => {
+	const s = fakeServer([
+		() => ok({ access_token: 'acct-1', expires_in: 3600 }),
+		() => err(401, 'secret_widerrufen'),
+		() => ok({ access_token: 'acct-2', expires_in: 3600 }),
+		() => ok({ run_id: 'r', period_year: 2026, period: '2026-11', counted: true, budget_currency: 'USD' }),
+		() => err(409, 'planung_nicht_lizenziert'),
+		() => err(503, 'planung_nicht_erreichbar'),
+	]);
+	const tokens = new AgentRunTokens(s.post, () => 0, freshStore());
+	const report = { agentUuid: AGENT, runId: 'r', cost: 1, currency: 'USD', priceKind: 'tabelle' as const };
+	assert.equal((await tokens.reportUsage(ACCOUNT, report, USAGE_URL)).counted, true);
+	assert.equal(s.calls[3].headers.Authorization, 'Bearer acct-2');
+	await assert.rejects(tokens.reportUsage(ACCOUNT, report, USAGE_URL), (e: AgentRunError) => e.code === 'planung_nicht_lizenziert' && e.reaction === 'stopReporting');
+	await assert.rejects(tokens.reportUsage(ACCOUNT, report, USAGE_URL), (e: AgentRunError) => e.code === 'planung_nicht_erreichbar' && e.reaction === 'retryLater');
+});
+
+test('usage: refused locally before any call — bad agent, bad run ID, cost without currency', async () => {
+	const s = fakeServer([]);
+	const tokens = new AgentRunTokens(s.post, () => 0, freshStore());
+	await assert.rejects(tokens.reportUsage(ACCOUNT, { agentUuid: 'x', runId: 'r' }), (e: AgentRunError) => e.code === 'agent_uuid_fehlt');
+	await assert.rejects(tokens.reportUsage(ACCOUNT, { agentUuid: AGENT, runId: 'mit leer' }), (e: AgentRunError) => e.code === 'run_id_ungueltig');
+	await assert.rejects(tokens.reportUsage(ACCOUNT, { agentUuid: AGENT, runId: 'r', cost: 1 }), (e: AgentRunError) => e.code === 'meldung_ungueltig' && e.reaction === 'fixConfig');
+	assert.equal(s.calls.length, 0);
+});

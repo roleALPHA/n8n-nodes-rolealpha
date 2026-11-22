@@ -198,3 +198,64 @@ test('Get Context over MCP finds the bundle among several content parts and repo
 	const denied = mcpCtx({ ...mcpParams, operation: 'getContext', agentUuid: AGENT }, { get_agent_context: () => 'Forbidden: admin:tenant required' });
 	await assert.rejects(new RoleAlpha().execute.call(denied.ctx), /Forbidden: admin:tenant required/);
 });
+
+/** A function account credential; each test its own client ID (the token cache is per process). */
+const fkCreds = (clientId: string) => ({ grantType: 'clientCredentials', accessTokenUrl: 'https://ra.test/api/auth/oauth/token', clientId, clientSecret: 's', authentication: 'header' });
+const PRICE_ROWS = [{ model: 'claude-opus-5-5', input: 4, cacheRead: 0.4, cacheWrite: 5, output: 20, currency: 'USD', asOf: '2026-11-20' }];
+
+function usageServer(answer: (form: URLSearchParams) => { statusCode: number; body: unknown }) {
+	return (opts: any) => {
+		const form = new URLSearchParams(opts.body);
+		if (form.get('grant_type') === 'client_credentials') return { statusCode: 200, body: JSON.stringify({ access_token: 'acct', expires_in: 3600 }) };
+		return { ...answer(form), body: JSON.stringify(answer(form).body) };
+	};
+}
+
+test('Report Usage prices the run from the price rows and reports it with the account token', async () => {
+	const { ctx, calls } = execCtx(
+		{ resource: 'agent', source: 'mcp', operation: 'reportUsage', runAgentUuid: AGENT.toUpperCase(), runId: 'exec-1', usageModel: 'claude-opus-5-5', usageInputTokens: '12000', usageCacheReadTokens: '30000', usageOutputTokens: '1800', priceRows: PRICE_ROWS },
+		fkCreds('fk-usage-1'),
+		usageServer(() => ({ statusCode: 200, body: { run_id: 'exec-1', period_year: 2026, period: '2026-11', counted: true, budget_currency: 'USD' } })),
+	);
+	const [[item]] = await new RoleAlpha().execute.call(ctx);
+	const report = calls[1];
+	assert.equal(report.url, 'https://ra.test/api/agent-lauf/verbrauch');
+	assert.equal(report.headers.Authorization, 'Bearer acct');
+	const form = Object.fromEntries(new URLSearchParams(report.body));
+	assert.deepEqual(form, { agent_uuid: AGENT, run_id: 'exec-1', model: 'claude-opus-5-5', input_tokens: '12000', cache_read_tokens: '30000', output_tokens: '1800', cost: '0.096', currency: 'USD', price_kind: 'tabelle', price_source: 'runner-tabelle 2026-11-20' });
+	assert.deepEqual(item.json.usage, { reported: true, runId: 'exec-1', periodYear: 2026, period: '2026-11', counted: true, budgetCurrency: 'USD', cost: 0.096, currency: 'USD' });
+	assert.equal(item.json.input, true, 'keeps the input item');
+});
+
+test('Report Usage without a matching price row sends tokens only (never a cost of 0)', async () => {
+	const { ctx, calls } = execCtx(
+		{ resource: 'agent', source: 'mcp', operation: 'reportUsage', runAgentUuid: AGENT, runId: 'exec-2', usageModel: 'other-model', usageInputTokens: '10', priceRows: PRICE_ROWS },
+		fkCreds('fk-usage-2'),
+		usageServer(() => ({ statusCode: 200, body: { run_id: 'exec-2', period_year: 2026, period: '2026-11', counted: false, budget_currency: 'USD' } })),
+	);
+	const [[item]] = await new RoleAlpha().execute.call(ctx);
+	const form = Object.fromEntries(new URLSearchParams(calls[1].body));
+	assert.equal(form.cost, undefined);
+	assert.equal(form.input_tokens, '10');
+	assert.equal((item.json.usage as any).cost, null);
+});
+
+test('Report Usage: a refusal comes back as data, the run is not broken', async () => {
+	const { ctx } = execCtx(
+		{ resource: 'agent', source: 'mcp', operation: 'reportUsage', runAgentUuid: AGENT, runId: 'exec-3', usageCost: '1.5', usageCurrency: 'eur' },
+		fkCreds('fk-usage-3'),
+		usageServer((form) => {
+			assert.equal(form.get('currency'), 'EUR');
+			return { statusCode: 409, body: { error: 'planung_nicht_lizenziert', error_description: 'nicht freigeschaltet' } };
+		}),
+	);
+	const [[item]] = await new RoleAlpha().execute.call(ctx);
+	assert.deepEqual(item.json.usage, { reported: false, code: 'planung_nicht_lizenziert', reaction: 'stopReporting', reason: 'nicht freigeschaltet' });
+});
+
+test('Report Usage refuses agent keys and impossible numbers', async () => {
+	const keys = execCtx({ resource: 'agent', source: 'agentKey', operation: 'reportUsage', runAgentUuid: AGENT, runId: 'r' }, keysCreds);
+	await assert.rejects(new RoleAlpha().execute.call(keys.ctx), /function account/);
+	const neg = execCtx({ resource: 'agent', source: 'mcp', operation: 'reportUsage', runAgentUuid: AGENT, runId: 'r', usageInputTokens: '-1' }, fkCreds('fk-usage-4'));
+	await assert.rejects(new RoleAlpha().execute.call(neg.ctx), /usageInputTokens/);
+});

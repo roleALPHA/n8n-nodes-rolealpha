@@ -24,7 +24,7 @@ export interface FunctionAccount {
 }
 
 /** What the runner does on a refusal. The code decides, never the text. */
-export type Reaction = 'fixConfig' | 'informAdmin' | 'removeAgent' | 'pause' | 'pauseUntilNextPeriod' | 'retryLater' | 'renewAccountToken' | 'endRun';
+export type Reaction = 'fixConfig' | 'informAdmin' | 'removeAgent' | 'pause' | 'pauseUntilNextPeriod' | 'retryLater' | 'renewAccountToken' | 'endRun' | 'stopReporting';
 
 const REACTIONS: Record<string, Reaction> = {
 	agent_uuid_fehlt: 'fixConfig',
@@ -47,6 +47,11 @@ const REACTIONS: Record<string, Reaction> = {
 	falsche_resource: 'renewAccountToken',
 	funktionskonto_unbekannt: 'renewAccountToken',
 	secret_widerrufen: 'renewAccountToken',
+	// Reporting usage (reportUsage).
+	meldung_ungueltig: 'fixConfig',
+	planung_nicht_lizenziert: 'stopReporting',
+	planung_nicht_erreichbar: 'retryLater',
+	installation_nicht_erreichbar: 'retryLater',
 };
 
 export function reactionFor(code: string, status = 0): Reaction {
@@ -88,6 +93,59 @@ export interface RunToken {
 	expiresAt: number;
 	agent: { uuid: string; name: string | null };
 	runId: string;
+	/** Where this run's usage is reported (`usage_url` of the exchange); absent on older servers. */
+	usageUrl?: string;
+}
+
+/** What one run consumed. Tokens are the run's totals; `cost` only from the runner's own pricing. */
+export interface UsageReport {
+	agentUuid: string;
+	runId: string;
+	model?: string;
+	inputTokens?: number;
+	cacheReadTokens?: number;
+	cacheWriteTokens?: number;
+	outputTokens?: number;
+	/** With `currency` and `priceKind`. Without a cost the run counts as "without a price", never as 0. */
+	cost?: number;
+	currency?: string;
+	/** `tabelle`: the runner's own price table. `listenpreis`: the SDK's list price. */
+	priceKind?: 'tabelle' | 'listenpreis';
+	priceSource?: string;
+}
+
+export interface UsageReceipt {
+	runId: string;
+	periodYear: number;
+	period: string;
+	/** Whether the run counts against the budget (priced, in the budget currency). */
+	counted: boolean;
+	budgetCurrency: string;
+}
+
+/** The reporting endpoint next to the token endpoint — used when the exchange did not name one. */
+export const USAGE_PATH = '/api/agent-lauf/verbrauch';
+export function defaultUsageUrl(tokenUrl: string): string {
+	return new URL(USAGE_PATH, tokenUrl).toString();
+}
+
+function usageForm(r: UsageReport): Record<string, string> {
+	const form: Record<string, string> = { agent_uuid: r.agentUuid.trim().toLowerCase(), run_id: r.runId };
+	const put = (k: string, v: string | number | undefined) => {
+		if (v !== undefined && v !== null && v !== '') form[k] = String(v);
+	};
+	put('model', r.model);
+	put('input_tokens', r.inputTokens);
+	put('cache_read_tokens', r.cacheReadTokens);
+	put('cache_write_tokens', r.cacheWriteTokens);
+	put('output_tokens', r.outputTokens);
+	if (r.cost !== undefined) {
+		put('cost', r.cost);
+		put('currency', r.currency);
+		put('price_kind', r.priceKind);
+	}
+	put('price_source', r.priceSource);
+	return form;
 }
 
 function parse(body: string): Record<string, unknown> {
@@ -181,9 +239,42 @@ export class AgentRunTokens {
 			expiresAt: this.now() + (Number(b.expires_in) || 900) * 1000,
 			agent: { uuid: agent, name: typeof named.name === 'string' ? named.name : null },
 			runId,
+			...(typeof b.usage_url === 'string' && b.usage_url ? { usageUrl: b.usage_url } : {}),
 		};
 		this.runs.set(key, token);
 		return token;
+	}
+
+	/**
+	 * Reports what one run consumed — with the ACCOUNT token, not the run token: once the budget is
+	 * spent a new swap fails, and the run that spent it must still be able to report. Each report of
+	 * the same run replaces the previous one, so report the run's running total, as often as useful.
+	 */
+	async reportUsage(a: FunctionAccount, report: UsageReport, usageUrl?: string): Promise<UsageReceipt> {
+		if (!UUID.test(report.agentUuid.trim())) throw new AgentRunError('agent_uuid_fehlt', 400, `Not an agent UUID: "${report.agentUuid}"`);
+		if (!isValidRunId(report.runId)) throw new AgentRunError('run_id_ungueltig', 400, 'Run ID: 1-128 characters of A-Z a-z 0-9 . _ : -');
+		if (report.cost !== undefined && (!report.currency || !report.priceKind)) {
+			throw new AgentRunError('meldung_ungueltig', 400, 'A cost needs currency and priceKind');
+		}
+		const url = usageUrl ?? defaultUsageUrl(a.tokenUrl);
+		const form = usageForm(report);
+		const send = async (fresh: boolean) => this.post(url, form, { Authorization: `Bearer ${await this.accountToken(a, fresh)}` });
+		let reply = await send(false);
+		if (reply.status !== 200 && reactionFor(refusal(reply).code, reply.status) === 'renewAccountToken') reply = await send(true);
+		if (reply.status !== 200) throw refusal(reply);
+		const b = parse(reply.body);
+		return {
+			runId: String(b.run_id ?? report.runId),
+			periodYear: Number(b.period_year),
+			period: String(b.period ?? ''),
+			counted: b.counted === true,
+			budgetCurrency: String(b.budget_currency ?? ''),
+		};
+	}
+
+	/** The usage URL the exchange named for this run, if its token is still cached in this process. */
+	usageUrlFor(a: FunctionAccount, agentUuid: string, runId: string): string | undefined {
+		return this.runs.get(`${this.accountKey(a)}|${agentUuid.trim().toLowerCase()}|${runId}`)?.usageUrl;
 	}
 
 	/** Forgets a run token, e.g. after the MCP endpoint refused it. */
