@@ -30,6 +30,20 @@ import { buildShareInput, checkShare, SHARE_SCHEMA, type ShareInput, type ShareR
 import { checkStart, findStaleWaits, planAfterRun, type FinishedRun, type Limits, type WaitRow } from '../../lib/waits';
 import { DEFAULT_SETTINGS, SETTING_BOUNDS, resolveSettings, type SettingRow } from '../../lib/settings';
 import { checkWrite, compilePatterns, consolidateMemory, selectMemory, type MemoryFact, type MemoryLimits, type MemoryPolicy, type RememberRequest } from '../../lib/memory';
+import {
+	buildCurationPrompt,
+	checkCuration,
+	lintPages,
+	locatePages,
+	selectKnowledge,
+	writeEntry,
+	type CircleInfo,
+	type KnowledgeLimits,
+	type KnowledgeOptions,
+	type KnowledgePage,
+	type Page,
+	type PageWrite,
+} from '../../lib/knowledge';
 import { AgentRunError, AgentRunTokens, mcpRefusalCode, type FormPost, type FunctionAccount } from '../../lib/agentRun';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -384,6 +398,14 @@ const properties: INodeProperties[] = [
 		displayOptions: show('prompt', ['buildSystemPrompt']),
 	},
 	{
+		displayName: 'Knowledge',
+		name: 'knowledge',
+		type: 'json',
+		default: '',
+		description: 'Output of Memory → Select Pages (optional). Set it, even empty, when knowledge pages are on: it adds what the pages of the roles and circles hold and the rules that keep knowledge apart from policies.',
+		displayOptions: show('prompt', ['buildSystemPrompt']),
+	},
+	{
 		displayName: 'Additional Rules',
 		name: 'extraRules',
 		type: 'string',
@@ -499,6 +521,12 @@ const properties: INodeProperties[] = [
 			{ name: 'Check Write', value: 'checkWrite', action: 'Check a fact to remember', description: 'Checks a remember call of the agent and returns the row to add, or the reason it is not kept' },
 			{ name: 'Select', value: 'select', action: 'Pick what the roles remember', description: 'The facts of the roles the agent fills now, for this step and these records, within the limits' },
 			{ name: 'Consolidate', value: 'consolidate', action: 'Clean up the memory', description: 'For a scheduler: rows to delete (expired, replaced, forgotten, over the limit per role)' },
+			{ name: 'Locate Pages', value: 'locatePages', action: 'Locate the knowledge pages', description: 'Paths of the pages of the roles the agent fills and of their circles, to read from your store' },
+			{ name: 'Select Pages', value: 'selectPages', action: 'Pick the knowledge for the prompt', description: 'What the pages of the agent\'s roles and circles hold, within the size limit; proposals for roleALPHA stay out' },
+			{ name: 'Write Page', value: 'writePage', action: 'Add a fact to its page', description: 'The new content of the page for a fact Check Write sent to a page; your store writes it if the page still has the base version' },
+			{ name: 'Build Curation Prompt', value: 'curationPrompt', action: 'Build the prompt to curate a page', description: 'Sort new entries in, merge, link, drop what is outdated or contradicts a policy' },
+			{ name: 'Check Curation', value: 'checkCuration', action: 'Check a curated page', description: 'Frontmatter kept, nothing about persons or secrets added, no rules, within the deletion limit' },
+			{ name: 'Lint Pages', value: 'lintPages', action: 'Find pages to curate or repair', description: 'For a scheduler: pages due for curation, of roles that are gone, without UUID, with broken links' },
 		],
 		default: 'checkWrite',
 	},
@@ -517,7 +545,66 @@ const properties: INodeProperties[] = [
 		default: '',
 		required: true,
 		description: 'Output of Agent → Get Context of this run. Only the roles the agent fills there count.',
-		displayOptions: show('memory', ['checkWrite', 'select']),
+		displayOptions: show('memory', ['checkWrite', 'select', 'locatePages', 'selectPages', 'curationPrompt']),
+	},
+	{
+		displayName: 'Pages',
+		name: 'pages',
+		type: 'json',
+		default: '={{ $input.all().map(item => item.json) }}',
+		description: 'Pages read from your store, each with path, content (Markdown) and version (a Git SHA, a counter, …)',
+		displayOptions: show('memory', ['selectPages', 'lintPages']),
+	},
+	{
+		displayName: 'Circles',
+		name: 'circles',
+		type: 'json',
+		default: '',
+		description: 'Output of Responsibility → Get Circle Lead for the agent (all items), e.g. {{ $(\'Get Circle Lead\').all().map(i => i.json) }}. Circles the bundle reaches count as well.',
+		displayOptions: show('memory', ['checkWrite', 'locatePages', 'selectPages', 'curationPrompt']),
+	},
+	{
+		displayName: 'Knowledge Pages',
+		name: 'knowledgePages',
+		type: 'boolean',
+		default: false,
+		description: 'Whether lasting facts of a role (scope role) and of a circle (scope circle) go to its page instead of a row. Notes on a step or records stay rows.',
+		displayOptions: show('memory', ['checkWrite']),
+	},
+	{
+		displayName: 'Write',
+		name: 'write',
+		type: 'json',
+		default: '',
+		required: true,
+		description: 'Output of Memory → Check Write with target "page"',
+		displayOptions: show('memory', ['writePage']),
+	},
+	{
+		displayName: 'Page',
+		name: 'page',
+		type: 'json',
+		default: '',
+		description: 'The page as read from your store: path, content, version. Empty when it does not exist yet.',
+		displayOptions: show('memory', ['writePage', 'curationPrompt', 'checkCuration']),
+	},
+	{
+		displayName: 'Answer',
+		name: 'answer',
+		type: 'string',
+		typeOptions: { rows: 6 },
+		default: '',
+		required: true,
+		description: 'What the model answered to Build Curation Prompt: the whole page in a markdown block',
+		displayOptions: show('memory', ['checkCuration']),
+	},
+	{
+		displayName: 'Existing Pages',
+		name: 'existingPages',
+		type: 'json',
+		default: '',
+		description: 'Optional: all pages of the store as path and name, so a curation may only link to pages that exist',
+		displayOptions: show('memory', ['curationPrompt', 'checkCuration']),
 	},
 	{
 		displayName: 'Step',
@@ -557,15 +644,15 @@ const properties: INodeProperties[] = [
 		name: 'knownRoles',
 		type: 'string',
 		default: '',
-		description: 'Optional: the roles that still exist (comma-separated or an array). Facts of other roles are removed.',
-		displayOptions: show('memory', ['consolidate']),
+		description: 'Optional: the roles (and, for pages, circles) that still exist (comma-separated or an array). Facts of other roles are removed; their pages are reported as orphaned.',
+		displayOptions: show('memory', ['consolidate', 'lintPages']),
 	},
 	{
 		displayName: 'Settings Rows',
 		name: 'settingRows',
 		type: 'json',
 		default: '',
-		description: 'Optional rows of the settings table: maxMemoryFacts, maxMemoryChars, memoryTtlDays, keepMemoryFacts (global < step < agent)',
+		description: 'Optional rows of the settings table: maxMemoryFacts, maxMemoryChars, memoryTtlDays, keepMemoryFacts, and for pages maxKnowledgeChars, maxPageChars, maxNewEntries, knowledgeCurateDays, maxCurationDeletePct, knowledgeLinkDepth (global < step < agent)',
 		displayOptions: { show: { resource: ['memory'] } },
 	},
 	{
@@ -575,7 +662,7 @@ const properties: INodeProperties[] = [
 		placeholder: 'Add Option',
 		default: {},
 		description: 'Your company decides. Secrets are always refused.',
-		displayOptions: show('memory', ['checkWrite']),
+		displayOptions: show('memory', ['checkWrite', 'checkCuration']),
 		options: [
 			{ displayName: 'Block E-Mail Addresses', name: 'blockEmails', type: 'boolean', default: true },
 			{ displayName: 'Block UUIDs', name: 'blockUuids', type: 'boolean', default: true },
@@ -583,6 +670,22 @@ const properties: INodeProperties[] = [
 			{ displayName: 'Block Names of Role Holders', name: 'blockPersonNames', type: 'boolean', default: true, description: 'Whether names of the persons who fill the roles of the step are refused (needs Step with holders)' },
 			{ displayName: 'Blocked Terms', name: 'blockedTerms', type: 'string', typeOptions: { rows: 4 }, default: '', description: 'One term per line (or comma-separated), matched as a whole word in any case, e.g. customer names read from your CRM with an expression' },
 			{ displayName: 'Blocked Patterns', name: 'blockedPatterns', type: 'string', typeOptions: { rows: 3 }, default: '', description: 'One regular expression per line, e.g. for an IBAN' },
+		],
+	},
+	{
+		displayName: 'Knowledge Options',
+		name: 'knowledgeOptions',
+		type: 'collection',
+		placeholder: 'Add Option',
+		default: {},
+		description: 'Use the same values in every node of your knowledge workflows',
+		displayOptions: show('memory', ['checkWrite', 'locatePages', 'selectPages', 'writePage', 'curationPrompt', 'checkCuration']),
+		options: [
+			{ displayName: 'Path Template', name: 'pathTemplate', type: 'string', default: '{entity}s/{uuid}.md', description: 'Where the page of a role or circle lives. Placeholders: {entity} (role, circle), {uuid}, {slug}. The UUID keeps a page when the role is renamed.' },
+			{ displayName: 'Language', name: 'language', type: 'options', options: [{ name: 'German', value: 'de' }, { name: 'English', value: 'en' }], default: 'de', description: 'Headings and type names of new pages; pages in either language are read' },
+			{ displayName: 'Normative Terms', name: 'normativeTerms', type: 'string', typeOptions: { rows: 3 }, default: '', description: 'Words that make a statement a rule (one per line or comma-separated). Empty: muss, darf nicht, verboten, must, must not, shall, not allowed, … A fact with one of them goes to the proposals for roleALPHA, not into the prompt.' },
+			{ displayName: 'Allow Rules in Curation', name: 'allowNormativeCuration', type: 'boolean', default: false, description: 'Whether a curation may add normative statements outside the proposals' },
+			{ displayName: 'Curating Role', name: 'curatingRole', type: 'string', default: '', description: 'Role (UUID or name) whose holders curate circle pages. Empty: any role of the circle.' },
 		],
 	},
 
@@ -729,6 +832,66 @@ function stepParamJson(ctx: IExecuteFunctions, i: number): Step | null {
 	const raw = parseJsonParam(ctx, 'stepJson', i) as IDataObject | undefined;
 	const step = (raw && typeof raw.step === 'object' ? raw.step : raw) as Step | undefined;
 	return step && typeof step === 'object' && step.uuid ? step : null;
+}
+
+function knowledgeLimits(rows: SettingRow[], agentUuid: string): KnowledgeLimits {
+	const s = resolveSettings(rows, { agentUuid }).settings;
+	return {
+		maxChars: s.maxKnowledgeChars,
+		maxPageChars: s.maxPageChars,
+		maxNewEntries: s.maxNewEntries,
+		curateAfterDays: s.knowledgeCurateDays,
+		maxDeletePct: s.maxCurationDeletePct,
+		linkDepth: s.knowledgeLinkDepth,
+	};
+}
+
+function knowledgeOptions(ctx: IExecuteFunctions, i: number): KnowledgeOptions {
+	const o = ctx.getNodeParameter('knowledgeOptions', i, {}) as IDataObject;
+	const terms = String(o.normativeTerms ?? '')
+		.split(/\r?\n|,/)
+		.map((t) => t.trim())
+		.filter(Boolean);
+	return {
+		pathTemplate: String(o.pathTemplate ?? '').trim() || undefined,
+		language: o.language === 'en' ? 'en' : 'de',
+		normativeTerms: terms.length ? terms : undefined,
+		allowNormativeCuration: o.allowNormativeCuration === true,
+		curatingRole: String(o.curatingRole ?? '').trim() || undefined,
+	};
+}
+
+function listParam<T>(ctx: IExecuteFunctions, name: string, i: number): T[] {
+	const raw = parseJsonParam(ctx, name, i) as unknown;
+	if (Array.isArray(raw)) return raw as T[];
+	if (raw && typeof raw === 'object') return [raw as T];
+	return [];
+}
+
+function pageParam(ctx: IExecuteFunctions, i: number): Page | null {
+	const raw = parseJsonParam(ctx, 'page', i) as IDataObject | undefined;
+	if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+	if (typeof raw.content !== 'string') return null;
+	return { path: String(raw.path ?? ''), content: raw.content, version: (raw.version as string | number | null | undefined) ?? null };
+}
+
+function memoryPolicyParam(ctx: IExecuteFunctions, i: number): MemoryPolicy {
+	const opts = ctx.getNodeParameter('memoryPolicy', i, {}) as IDataObject;
+	const lines = (v: unknown, split: RegExp) => String(v ?? '').split(split).map((t) => t.trim()).filter(Boolean);
+	const policy: MemoryPolicy = {
+		blockEmails: opts.blockEmails !== false,
+		blockUuids: opts.blockUuids !== false,
+		blockPhoneNumbers: opts.blockPhoneNumbers !== false,
+		blockPersonNames: opts.blockPersonNames !== false,
+		blockedTerms: lines(opts.blockedTerms, /\r?\n|,/),
+		blockedPatterns: lines(opts.blockedPatterns, /\r?\n/),
+	};
+	try {
+		compilePatterns(policy.blockedPatterns);
+	} catch (error) {
+		throw new NodeOperationError(ctx.getNode(), (error as Error).message, { itemIndex: i });
+	}
+	return policy;
 }
 
 function memoryLimits(rows: SettingRow[], bundle: ContextBundle, step: Step | null): MemoryLimits {
@@ -1028,8 +1191,32 @@ export class RoleAlpha implements INodeType {
 			return [[{ json: plan as unknown as IDataObject }]];
 		}
 
+		// Pages: Locate, Select and Lint look at all pages (or none) at once.
+		if (resource === 'memory' && ['locatePages', 'selectPages', 'lintPages'].includes(operation)) {
+			const settingRowsRaw = parseJsonParam(this, 'settingRows', 0);
+			const settingRows = (Array.isArray(settingRowsRaw) ? settingRowsRaw : []) as SettingRow[];
+			if (operation === 'lintPages') {
+				const knownRaw = this.getNodeParameter('knownRoles', 0, '') as unknown;
+				const known = (Array.isArray(knownRaw) ? knownRaw : String(knownRaw ?? '').split(',')).map((v) => String(v).trim()).filter(Boolean);
+				const res = lintPages(parseJsonParam(this, 'pages', 0), { knownUuids: known, limits: knowledgeLimits(settingRows, '') });
+				return [[{ json: res as unknown as IDataObject }]];
+			}
+			const bundle = bundleParam(this, 0);
+			const circles = listParam<CircleInfo>(this, 'circles', 0);
+			const opts = knowledgeOptions(this, 0);
+			let refs;
+			try {
+				refs = locatePages(bundle, circles, opts);
+			} catch (error) {
+				throw new NodeOperationError(this.getNode(), (error as Error).message);
+			}
+			if (operation === 'locatePages') return [refs.map((r) => ({ json: r as unknown as IDataObject }))];
+			const res = selectKnowledge(parseJsonParam(this, 'pages', 0), { bundle, circles, opts, limits: knowledgeLimits(settingRows, bundle.agent?.uuid ?? '') });
+			return [[{ json: res as unknown as IDataObject }]];
+		}
+
 		// Memory: Select and Consolidate look at all stored rows at once.
-		if (resource === 'memory' && operation !== 'checkWrite') {
+		if (resource === 'memory' && (operation === 'select' || operation === 'consolidate')) {
 			const rows = parseJsonParam(this, 'rows', 0);
 			const settingRowsRaw = parseJsonParam(this, 'settingRows', 0);
 			const settingRows = (Array.isArray(settingRowsRaw) ? settingRowsRaw : []) as SettingRow[];
@@ -1049,6 +1236,41 @@ export class RoleAlpha implements INodeType {
 
 		for (let i = 0; i < items.length; i++) {
 			try {
+				if (resource === 'memory' && operation !== 'checkWrite') {
+					const settingRowsRaw = parseJsonParam(this, 'settingRows', i);
+					const settingRows = (Array.isArray(settingRowsRaw) ? settingRowsRaw : []) as SettingRow[];
+					const opts = knowledgeOptions(this, i);
+					const page = pageParam(this, i);
+					let res: unknown;
+					if (operation === 'writePage') {
+						const write = parseJsonParam(this, 'write', i) as PageWrite;
+						res = writeEntry(write, page, opts, knowledgeLimits(settingRows, String(write?.entry?.agent ?? '')));
+					} else if (operation === 'curationPrompt') {
+						if (!page) throw new NodeOperationError(this.getNode(), 'Page is empty: there is nothing to curate', { itemIndex: i });
+						const bundle = bundleParam(this, i);
+						res = buildCurationPrompt({
+							page,
+							bundle,
+							circles: listParam<CircleInfo>(this, 'circles', i),
+							existing: listParam<{ path: string; name?: string }>(this, 'existingPages', i),
+							opts,
+							limits: knowledgeLimits(settingRows, bundle.agent?.uuid ?? ''),
+						});
+					} else {
+						if (!page) throw new NodeOperationError(this.getNode(), 'Page is empty: give the page that was curated', { itemIndex: i });
+						const existing = listParam<{ path: string }>(this, 'existingPages', i).map((p) => String(p?.path ?? '')).filter(Boolean);
+						res = checkCuration(page, String(this.getNodeParameter('answer', i, '') ?? ''), {
+							policy: memoryPolicyParam(this, i),
+							opts,
+							limits: knowledgeLimits(settingRows, ''),
+							existingPaths: existing,
+						});
+					}
+					// A refusal is data, so the workflow can retry, report or leave the page as it is.
+					out.push({ json: res as IDataObject, pairedItem: { item: i } });
+					continue;
+				}
+
 				if (resource === 'memory') {
 					const bundle = bundleParam(this, i);
 					const step = stepParamJson(this, i);
@@ -1056,21 +1278,8 @@ export class RoleAlpha implements INodeType {
 					const limits = memoryLimits((Array.isArray(settingRowsRaw) ? settingRowsRaw : []) as SettingRow[], bundle, step);
 					const raw = parseJsonParam(this, 'request', i) as unknown;
 					const request = (raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}) as RememberRequest;
-					const opts = this.getNodeParameter('memoryPolicy', i, {}) as IDataObject;
-					const lines = (v: unknown, split: RegExp) => String(v ?? '').split(split).map((t) => t.trim()).filter(Boolean);
-					const policy: MemoryPolicy = {
-						blockEmails: opts.blockEmails !== false,
-						blockUuids: opts.blockUuids !== false,
-						blockPhoneNumbers: opts.blockPhoneNumbers !== false,
-						blockPersonNames: opts.blockPersonNames !== false,
-						blockedTerms: lines(opts.blockedTerms, /\r?\n|,/),
-						blockedPatterns: lines(opts.blockedPatterns, /\r?\n/),
-					};
-					try {
-						compilePatterns(policy.blockedPatterns);
-					} catch (error) {
-						throw new NodeOperationError(this.getNode(), (error as Error).message, { itemIndex: i });
-					}
+					const policy = memoryPolicyParam(this, i);
+					const knowledgeOn = this.getNodeParameter('knowledgePages', i, false) === true;
 					const res = checkWrite(request, {
 						bundle,
 						step,
@@ -1078,6 +1287,7 @@ export class RoleAlpha implements INodeType {
 						runId: String(this.getNodeParameter('memoryRunId', i, '') ?? ''),
 						ttlDays: limits.ttlDays,
 						policy,
+						knowledge: knowledgeOn ? { enabled: true, circles: listParam<CircleInfo>(this, 'circles', i), opts: knowledgeOptions(this, i) } : null,
 					});
 					// A refusal is data, so the model can shorten or rephrase the fact.
 					out.push({ json: res as unknown as IDataObject, pairedItem: { item: i } });
@@ -1172,6 +1382,12 @@ export class RoleAlpha implements INodeType {
 						: memoryRaw && typeof memoryRaw === 'object' && Array.isArray((memoryRaw as IDataObject).memory)
 							? ((memoryRaw as IDataObject).memory as unknown as MemoryFact[])
 							: null;
+					const knowledgeRaw = parseJsonParam(this, 'knowledge', i) as unknown;
+					const knowledge = Array.isArray(knowledgeRaw)
+						? (knowledgeRaw as KnowledgePage[])
+						: knowledgeRaw && typeof knowledgeRaw === 'object' && Array.isArray((knowledgeRaw as IDataObject).knowledge)
+							? ((knowledgeRaw as IDataObject).knowledge as unknown as KnowledgePage[])
+							: null;
 					const rules = String(this.getNodeParameter('extraRules', i, '') ?? '')
 						.split(/\r?\n/)
 						.map((r) => r.trim())
@@ -1184,6 +1400,7 @@ export class RoleAlpha implements INodeType {
 						extraRules: rules,
 						share,
 						memory,
+						knowledge,
 					});
 					const json: IDataObject = { ...items[i].json, systemPrompt };
 					if (share && step) json.task = buildTask({ step, share, triggerType: (this.getNodeParameter('triggerType', i, '') as string) || undefined });

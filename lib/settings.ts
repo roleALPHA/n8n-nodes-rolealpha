@@ -30,6 +30,18 @@ export interface RunnerSettings {
 	memoryTtlDays: number;
 	/** Facts kept per role in the memory store. */
 	keepMemoryFacts: number;
+	/** Characters of all knowledge pages in one prompt. */
+	maxKnowledgeChars: number;
+	/** Size of a knowledge page before it has to be curated. */
+	maxPageChars: number;
+	/** New entries on a page from which it is curated. */
+	maxNewEntries: number;
+	/** Days after which new entries are curated even below maxNewEntries. */
+	knowledgeCurateDays: number;
+	/** Share of curated text (percent) one curation may delete. */
+	maxCurationDeletePct: number;
+	/** 0: only the own pages go into the prompt; 1: also pages they link to. */
+	knowledgeLinkDepth: number;
 }
 
 export type SettingKey = keyof RunnerSettings;
@@ -46,6 +58,12 @@ export const DEFAULT_SETTINGS: RunnerSettings = {
 	maxMemoryChars: 4000,
 	memoryTtlDays: 180,
 	keepMemoryFacts: 200,
+	maxKnowledgeChars: 6000,
+	maxPageChars: 12000,
+	maxNewEntries: 20,
+	knowledgeCurateDays: 7,
+	maxCurationDeletePct: 30,
+	knowledgeLinkDepth: 0,
 };
 
 export const SETTING_BOUNDS: Record<Exclude<SettingKey, 'escalate'>, { min: number; max: number }> = {
@@ -59,6 +77,12 @@ export const SETTING_BOUNDS: Record<Exclude<SettingKey, 'escalate'>, { min: numb
 	maxMemoryChars: { min: 0, max: 20000 },
 	memoryTtlDays: { min: 1, max: 3650 },
 	keepMemoryFacts: { min: 10, max: 2000 },
+	maxKnowledgeChars: { min: 0, max: 40000 },
+	maxPageChars: { min: 2000, max: 100000 },
+	maxNewEntries: { min: 1, max: 500 },
+	knowledgeCurateDays: { min: 1, max: 90 },
+	maxCurationDeletePct: { min: 0, max: 100 },
+	knowledgeLinkDepth: { min: 0, max: 1 },
 };
 
 export interface SettingRow {

@@ -51,6 +51,11 @@ next run follows. You don't edit code and you don't republish anything.
 - **Memory that belongs to the role.** What an agent learns is kept for its role, without
   approval. Give the role to another agent and the memory goes with it. Who decides and who
   fills a role is never kept: it is read from roleALPHA on every run.
+- **Knowledge of roles and circles, kept apart from policies.** Lasting experience goes to a
+  Markdown page per role and per circle, a small wiki people can read and correct. It is
+  curated by the roles themselves. Rules stay in roleALPHA: a statement that reads as one
+  becomes a proposal, not knowledge. Pages live where the company wants: an n8n data table,
+  Git, a folder.
 - **Limits you can change without republishing.** Retries, wait times, run time and tool
   calls come from a settings table and are clamped to fixed bounds.
 
@@ -113,15 +118,19 @@ Scheduler (cron)                        Event router (one webhook)
                           ├ Wait: Check Start               (lease, duplicate-run guard)
                           ├ Share: Build Input → model → Share: Check (cached)
                           ├ Memory: Select                  (facts of the agent's roles, this step, these records)
+                          ├ Memory: Locate Pages → store → Memory: Select Pages
+                          │                                 (knowledge of the agent's roles and circles, optional)
                           ├ roleALPHA: Build System Prompt
                           ├ AI Agent (+ data tool limited to the domains of the agent's roles,
                           │           + roleALPHA: Tool, read only, as the agent,
-                          │           + remember → Memory: Check Write → add row)
+                          │           + remember → Memory: Check Write → add row,
+                          │                        or → read page → Memory: Write Page → store page)
                           └ Wait: Plan After Run            (done row, wake-ups, lease released)
 
 Scheduler, every tick
  └ Wait: Find Stale Waits → wake (claimed) · remove dead leases · escalate → Get Circle Lead
  └ Memory: Consolidate    → delete replaced, forgotten and expired facts
+ └ Memory: Lint Pages     → per page due: Build Curation Prompt → model → Check Curation → store page
 ```
 
 **Every read is the agent's own.** With **Connect As: Agent** the node swaps the function
@@ -397,6 +406,128 @@ role or step, proposed as a draft.
    Pass the role UUIDs that still exist as **Known Role UUIDs** to remove the memory of
    roles that are gone.
 
+## Knowledge of roles and circles
+
+Memory rows are notes on the work in progress: they belong to a step or to records and expire.
+What a role learns for good is something else: how the work is done well, what worked, what
+was observed. That is knowledge of the organisation. It belongs to the role, or to the circle
+when it holds for its other roles too, and people should be able to read, link and correct it.
+So it is kept as **Markdown pages with YAML frontmatter**, one per role and one per circle: a
+small wiki the roles keep themselves.
+
+As with the rows, the package keeps no page itself. It decides; the workflow reads and writes
+with ordinary n8n nodes. It sees a page only as `{ path, content, version }`, where `version`
+is whatever the store uses to notice a concurrent change. Typical stores:
+
+| Store | Read | Write | `version` |
+| --- | --- | --- | --- |
+| **n8n data table** (stays on the company's own n8n) | Get rows | Update the row where `path` and `version` match, else insert; no row updated = changed meanwhile | a counter (`nextVersion`) |
+| **Git** (GitHub, GitLab, Gitea) via HTTP Request on the contents API | GET the file, decode base64 | PUT with the `sha` read before; 409 = changed meanwhile | the file's SHA |
+| **Folder** (a mounted vault, e.g. Obsidian or Tolaria) | Read Files from Disk | Write Files from Disk | modification time |
+
+A data table for pages needs the columns `path, entity, uuid, name, content, version`. With
+Git, any editor that reads Markdown with wiki links shows the pages; a Tolaria or Obsidian
+vault of its own works as is. Give the store to the agents alone: a repository or vault with
+meeting or sales notes in it is the wrong place.
+
+**A page**
+
+```markdown
+---
+type: Rollenwissen
+schema: rolealpha-knowledge/1
+entity: role
+uuid: e31893c0-…
+name: "Kampagnenmanagement"
+updated: 2026-11-22T10:00:00.000Z
+---
+# Kampagnenmanagement – Wissen
+
+> Erfahrung dieser Rolle aus ihrer Arbeit. Keine Regeln: Verbindliches steht in roleALPHA.
+
+## Neu
+- Beiträge mit einer Zahl im ersten Satz werden seltener abgelehnt. <!-- ra:{"at":"…","topic":"einstieg","run":"68266","agent":"…"} -->
+
+## Kampagnenformate
+- …
+
+## Vorschläge für roleALPHA
+- Jeder Beitrag muss eine Kampagne nennen. <!-- ra:{…} -->
+
+## Siehe auch
+- [[circles/<uuid>|Marketing – Kreiswissen]]
+```
+
+The path follows the UUID (`roles/<uuid>.md`, `circles/<uuid>.md`; **Path Template** in the
+Knowledge Options), so a page survives a renamed role; its title and `name` follow the name.
+Headings come in German or English (**Language**); pages in either are read. Entries of agents
+carry their metadata in an HTML comment, so a newer fact on the same topic replaces the older
+one and a topic can be forgotten; text people write needs none and stays.
+
+**Who writes what**
+
+- **Remember** writes, as before, through **Check Write**. With **Knowledge Pages** on, scope
+  `role` (the default) goes to the page of the role and scope `circle` to the page of its
+  circle; `step` and `records` stay rows. The same checks apply: a role the agent fills, a
+  circle one of its roles is in (from **Get Circle Lead**, or reached in the bundle), no
+  secrets, persons, contact data or the company's blocked terms. **Write Page** adds the entry
+  under "Neu" and returns the whole new page with the version it is based on.
+- **Curation** sorts the new entries into topics, merges and links them, and drops what is
+  outdated or contradicts a policy: the wiki part. The page of a role is curated only by an
+  agent that fills the role; the page of a circle by any role of the circle, or with
+  **Curating Role** only by that one. **Lint Pages** names the pages that are due (`maxNewEntries`
+  new entries, new entries older than `knowledgeCurateDays`, or larger than `maxPageChars`).
+  **Build Curation Prompt** gives the model the page, the policies of the curating agent and
+  the pages it may link to; **Check Curation** applies the answer only when the frontmatter is
+  kept, nothing it adds names a person, contact data, a secret or a blocked term, no rule is
+  added, every link points to a page that exists and no more than `maxCurationDeletePct` of the
+  curated text is gone.
+- **People** edit pages in their editor or the data table. Nothing they write is checked or
+  removed by an agent unless it duplicates an entry or contradicts a policy, and every change
+  is in the history of the store.
+
+**Knowledge and policies stay apart.** Policies, accountabilities and process steps are
+binding and live in roleALPHA; they change only by an approved draft. Knowledge says how a role
+does its work well and changes without approval. The package holds the line:
+
+| | Policy, accountability, step (roleALPHA) | Knowledge (pages) |
+| --- | --- | --- |
+| Says | what has to be, what is to be done | what worked, what was observed |
+| Changes | by a draft a person approves | without approval, in the store's history |
+| In the prompt | binding, wins | experience, data, not instructions |
+
+- A fact with a **normative term** (`muss`, `darf nicht`, `verboten`, `must`, `must not`,
+  `shall`, `not allowed`, …; your own list in **Normative Terms**) goes to "Vorschläge für
+  roleALPHA" / "Proposals for roleALPHA". That section never reaches the prompt. A curation
+  either rephrases it as experience or leaves it for the role that proposes changes of roles
+  and policies in roleALPHA.
+- A curation may not add normative statements outside the proposals (**Allow Rules in
+  Curation** turns this off), is told never to copy a policy into a page and to drop entries
+  that contradict one.
+- The prompt lists knowledge after the binding parts and says that policies, accountabilities
+  and the current step win; when a page contradicts them, the agent follows roleALPHA and
+  forgets the outdated topic.
+
+**Into the prompt.** **Locate Pages** gives the paths of the agent's pages; read them, pass
+them to **Select Pages** and its output to **Build System Prompt → Knowledge**. Only pages
+whose frontmatter names the role or circle count, so a page at the wrong path is not read.
+With `knowledgeLinkDepth` 1, `linked` names the pages they link to; read those too and run
+Select Pages again with all of them.
+
+**Setting it up**
+
+1. Pick a store and create it (data table with the columns above, a repository, a folder).
+2. In the runner, after Get Context: **Get Circle Lead** for the agent, **Locate Pages**, read
+   the pages, **Select Pages**, and pass it to **Build System Prompt → Knowledge**.
+3. In the `remember` sub-workflow: **Check Write** with **Knowledge Pages** on and the circles;
+   when `target` is `page`, read the page at `page.path`, run **Write Page** and write
+   `content` if the page still has `baseVersion`. If it changed meanwhile, read it again and
+   run Write Page again: entries are only added, nothing is lost.
+4. In the scheduler: read all pages, **Lint Pages**; for each page in `curate`, start a run of
+   an agent that may curate it with **Build Curation Prompt**, then **Check Curation** on its
+   answer and write `content`. Move `orphaned` pages to an archive.
+5. Use the same Knowledge Options in every node.
+
 ## Nodes
 
 ### roleALPHA (`roleAlpha`)
@@ -424,6 +555,12 @@ role or step, proposed as a draft.
 | Wait | Find Stale Waits | For a scheduler: waits nobody answered in time (e.g. a person fills the awaited role), queued starts whose busy run died, dead leases, expired rows, and waits at the attempt limit to escalate (`escalate`, reported once). | – |
 | Memory | Check Write | Checks a `remember` call: a role the agent fills (from the bundle), scope, size, secrets, and what the company never keeps. Returns `ok` and the `row` to add, or `error` and `problems` as data. | – |
 | Memory | Select | The facts for the prompt: roles the agent fills now, this step and these records, the newest of each topic, nothing forgotten or expired, within `maxMemoryFacts` and `maxMemoryChars`. Returns `memory` and `omitted`. | – |
+| Memory | Locate Pages | One item per page of the agent: the roles it fills and the circles of these roles (**Circles** from Get Circle Lead, or reached in the bundle), with `path`, `entity`, `uuid`, `name`. | – |
+| Memory | Select Pages | The knowledge for the prompt from the pages read: only pages whose frontmatter names the role or circle, without proposals and metadata, within `maxKnowledgeChars`. Returns `knowledge`, `missing`, `linked` (with `knowledgeLinkDepth` 1) and `omitted`. | – |
+| Memory | Write Page | Adds an entry that Check Write sent to a page: under "Neu", or under the proposals when it reads as a rule; replaces an older entry on the same topic or forgets it. Makes a missing page with frontmatter. Returns `content`, `baseVersion`, `nextVersion`, or `ok: false` (another role's page at that path, page full). | – |
+| Memory | Build Curation Prompt | System prompt and task to curate one page, for an agent that may curate it, with its policies and the pages it may link to. | – |
+| Memory | Check Curation | Checks the page a model returned: frontmatter kept, nothing about persons, contact data, secrets or blocked terms added, no rule added, links to existing pages, deletion within `maxCurationDeletePct`. Returns the page to write or `problems`. | – |
+| Memory | Lint Pages | For a scheduler: `curate` (pages due), `orphaned` (with **Known Role UUIDs**, roles and circles), `invalid`, `duplicates` and `brokenLinks`. | – |
 | Memory | Consolidate | For a scheduler: `remove` lists replaced, forgotten and expired rows, rows of roles that are gone (with **Known Role UUIDs**) and rows over `keepMemoryFacts` per role. | – |
 | Settings | Resolve | Runner limits from defaults and a settings table (`scope, target, key, value`): default < global < step < agent. Every value is clamped to fixed bounds; unknown keys and unusable values are reported in `settingProblems` and never applied. | – |
 | Schedule | Is Due | Decides from the step `frequency` (and `termin` / due date) whether a run is due in the current period. | – |
@@ -491,6 +628,12 @@ with `scope = global` applies to every run. `step` (target: step UUID or custom 
 | `maxMemoryChars` | 4000 | 0–20000 | Characters of all remembered facts in one prompt |
 | `memoryTtlDays` | 180 | 1–3650 | Days a remembered fact counts; a shorter value also applies to older facts |
 | `keepMemoryFacts` | 200 | 10–2000 | Facts kept per role in the store (Consolidate) |
+| `maxKnowledgeChars` | 6000 | 0–40000 | Characters of all knowledge pages in one prompt |
+| `maxPageChars` | 12000 | 2000–100000 | Size of a page before it is curated; a write is refused beyond twice this size |
+| `maxNewEntries` | 20 | 1–500 | New entries on a page from which it is curated |
+| `knowledgeCurateDays` | 7 | 1–90 | Days after which new entries are curated even below `maxNewEntries` |
+| `maxCurationDeletePct` | 30 | 0–100 | Share of the curated text one curation may delete |
+| `knowledgeLinkDepth` | 0 | 0–1 | 1: pages linked from the own pages go into the prompt too |
 
 A row with a value outside the bounds is clamped and reported. A wrong row can make the
 runner more careful, never unbounded.
@@ -517,6 +660,11 @@ record_keys, event, run_id, attempts, progress, at`.
 - Duplicate runs are blocked by leases, and wake-ups are claimed before they fire.
 - Memory belongs to roles the agent fills in the run; secrets are never kept, and what else is
   never kept each company sets itself. Remembered facts reach the prompt as data, with limits.
+- Knowledge pages are written only for roles the agent fills and circles of these roles, read
+  only when their frontmatter names them, and curated only by an agent of that role or circle.
+  What an agent or a curation adds is checked like a remembered fact; a rule never becomes
+  knowledge. A store with history keeps what was forgotten, so persons and secrets are refused
+  before they are written.
 - No credentials are kept in wait, settings or cache rows. The share cache key holds no
   record content, and a cached answer is checked again like a fresh one.
 
