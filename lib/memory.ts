@@ -25,13 +25,15 @@
 import type { Step } from './graph';
 import type { BundleItem, ContextBundle } from './prompt';
 import { recordKey, sameRecords } from './waits';
+import { isNormative, locatePages, ownCircles, type CircleInfo, type KnowledgeEntry, type KnowledgeOptions, type PageRef } from './knowledge';
 
 /** Name of the tool an agent calls to keep a fact for its role. */
 export const REMEMBER_TOOL = 'remember';
 export const MAX_FACT_CHARS = 500;
 export const MAX_TOPIC_CHARS = 80;
 
-export type MemoryScope = 'role' | 'step' | 'records';
+/** step and records are kept as rows; role as rows, or as the role's page with knowledge pages on; circle only as the circle's page. */
+export type MemoryScope = 'role' | 'step' | 'records' | 'circle';
 
 export interface MemoryRow {
 	id?: number | string;
@@ -96,9 +98,14 @@ export interface WriteContext {
 	now?: Date;
 	ttlDays?: number;
 	policy?: MemoryPolicy;
+	/** Knowledge pages: lasting facts of a role or circle go to its page instead of a row. */
+	knowledge?: { enabled: boolean; circles?: CircleInfo[] | null; opts?: KnowledgeOptions } | null;
 }
 
-export type WriteResult = { ok: true; row: MemoryRow; replaces: string } | { ok: false; error: string; problems: string[] };
+export type WriteResult =
+	| { ok: true; target: 'rows'; row: MemoryRow; replaces: string }
+	| { ok: true; target: 'page'; page: PageRef; entry: KnowledgeEntry }
+	| { ok: false; error: string; problems: string[] };
 
 export interface MemoryFact {
 	id: number | string | null;
@@ -238,9 +245,28 @@ export function checkWrite(request: RememberRequest, ctx: WriteContext): WriteRe
 	const now = ctx.now ?? new Date();
 	const roles = ownRoles(ctx.bundle);
 	if (roles.length === 0) return refuse('The agent fills no role in this run, so there is nothing to remember for.');
+	const pages = !!ctx.knowledge?.enabled;
+	const scope = (lower(request.scope) || 'role') as MemoryScope;
+	const scopes: MemoryScope[] = pages ? ['role', 'circle', 'step', 'records'] : ['role', 'step', 'records'];
+	if (!scopes.includes(scope)) return refuse(`Scope is one of ${scopes.join(', ')}.`);
+	const wanted = lower(request.role);
+
+	// A circle: named by UUID or name, or as one of the agent's roles in it, else the only circle of its roles.
+	if (scope === 'circle') {
+		const circles = ownCircles(ctx.bundle, ctx.knowledge?.circles);
+		if (circles.length === 0) return refuse('None of your roles is in a circle known to this run; use scope role.');
+		let circle = wanted ? circles.find((c) => c.uuid === wanted || lower(c.name) === wanted || c.roles.some((r) => r === wanted || lower(roles.find((x) => lower(x.uuid) === r)?.name) === wanted)) : undefined;
+		if (wanted && !circle) return refuse(`"${String(request.role)}" is not a circle of your roles. Use one of: ${circles.map((c) => c.name).join(', ')}.`);
+		if (!circle) {
+			if (circles.length !== 1) return refuse(`Name the circle the fact belongs to: ${circles.map((c) => c.name).join(', ')}.`);
+			circle = circles[0];
+		}
+		const ref = locatePages(ctx.bundle, ctx.knowledge?.circles, ctx.knowledge?.opts).find((r) => r.entity === 'circle' && r.uuid === circle!.uuid);
+		if (!ref) return refuse('The page of this circle could not be found.');
+		return pageEntry(request, ref, ctx, now);
+	}
 
 	// The role: named by UUID or name, else the only own role on the step, else the only own role.
-	const wanted = lower(request.role);
 	let role: BundleItem | undefined;
 	if (wanted) {
 		role = roles.find((r) => lower(r.uuid) === wanted || lower(r.name) === wanted);
@@ -252,8 +278,11 @@ export function checkWrite(request: RememberRequest, ctx: WriteContext): WriteRe
 		role = candidates[0];
 	}
 
-	const scope = (lower(request.scope) || 'role') as MemoryScope;
-	if (!['role', 'step', 'records'].includes(scope)) return refuse('Scope is one of role, step or records.');
+	if (scope === 'role' && pages) {
+		const ref = locatePages(ctx.bundle, ctx.knowledge?.circles, ctx.knowledge?.opts).find((r) => r.entity === 'role' && r.uuid === lower(role!.uuid));
+		if (!ref) return refuse('The page of this role could not be found.');
+		return pageEntry(request, ref, ctx, now);
+	}
 	const stepUuid = lower(ctx.step?.uuid);
 	const records = recordKey(ctx.recordKeys);
 	if (scope !== 'role' && !stepUuid) return refuse(`Scope "${scope}" needs a step; this run has none. Use scope role.`);
@@ -281,7 +310,34 @@ export function checkWrite(request: RememberRequest, ctx: WriteContext): WriteRe
 		at: now.toISOString(),
 		expires_at: new Date(now.getTime() + ttlDays * DAY).toISOString(),
 	};
-	return { ok: true, row, replaces: groupKey(row) };
+	return { ok: true, target: 'rows', row, replaces: groupKey(row) };
+}
+
+/** The checks for a fact that goes to the page of a role or circle. */
+function pageEntry(request: RememberRequest, ref: PageRef, ctx: WriteContext, now: Date): WriteResult {
+	const forget = request.forget === true || lower(request.forget) === 'true';
+	const fact = forget ? '' : String(request.fact ?? '').replace(/\s+/g, ' ').trim();
+	if (!forget && !fact) return refuse('Give the fact to remember, or set forget with the topic.');
+	if (fact.length > MAX_FACT_CHARS) return refuse(`The fact has ${fact.length} characters; keep it under ${MAX_FACT_CHARS}, one fact per call.`);
+	const topic = topicOf(request.topic, fact);
+	if (!topic) return refuse('Give a topic for what to forget.');
+	const problems = factProblems(`${fact} ${String(request.topic ?? '')}`, ctx.policy, ctx.step);
+	if (problems.length) return refuse(`Not kept: ${problems.join('; ')}.`, problems);
+	const terms = ctx.knowledge?.opts?.normativeTerms;
+	return {
+		ok: true,
+		target: 'page',
+		page: ref,
+		entry: {
+			text: fact,
+			topic,
+			at: now.toISOString(),
+			run: ctx.runId ?? '',
+			agent: lower(ctx.bundle.agent?.uuid),
+			forget,
+			normative: !forget && isNormative(fact, terms && terms.length ? terms : undefined),
+		},
+	};
 }
 
 function timeOf(row: MemoryRow): number {

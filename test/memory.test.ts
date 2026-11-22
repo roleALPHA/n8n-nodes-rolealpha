@@ -55,7 +55,7 @@ test('memory: a fact belongs to a role the agent fills, never to its circle or a
 	assert.deepEqual(ownRoles(bundle()).map((r) => r.name), ['Controlling']);
 
 	const ok = checkWrite({ fact: 'Odoo leaves the field "Kostenstelle" empty on credit notes.', topic: 'Odoo credit notes' }, { bundle: bundle(), step, runId: 'run-1', now: NOW, ttlDays: 30 });
-	assert.ok(ok.ok);
+	assert.ok(ok.ok && ok.target === "rows");
 	assert.equal(ok.row.role_uuid, CONTROLLING);
 	assert.equal(ok.row.step_uuid, '', 'scope role is the default');
 	assert.equal(ok.row.topic, 'odoo credit notes');
@@ -73,17 +73,17 @@ test('memory: a fact belongs to a role the agent fills, never to its circle or a
 	const unclear = checkWrite({ fact: 'x' }, { bundle: two, now: NOW });
 	assert.ok(!unclear.ok && /Name the role/.test(unclear.error), 'two roles and no step: the model has to name one');
 	const onStep = checkWrite({ fact: 'x' }, { bundle: two, step, now: NOW });
-	assert.ok(onStep.ok && onStep.row.role_uuid === CONTROLLING, 'the only own role on the step is taken');
+	assert.ok(onStep.ok && onStep.target === "rows" && onStep.row.role_uuid === CONTROLLING, 'the only own role on the step is taken');
 	const byName = checkWrite({ fact: 'x', role: 'reporting' }, { bundle: two, step, now: NOW });
-	assert.ok(byName.ok && byName.row.role_uuid === REPORTING);
+	assert.ok(byName.ok && byName.target === "rows" && byName.row.role_uuid === REPORTING);
 	assert.ok(!checkWrite({ fact: 'x' }, { bundle: { ...bundle(), context: [] }, now: NOW }).ok, 'no role, no memory');
 });
 
 test('memory: scope step and records need a step and records of the run', () => {
 	const s = checkWrite({ fact: 'x', scope: 'step' }, { bundle: bundle(), step, now: NOW });
-	assert.ok(s.ok && s.row.step_uuid === STEP && s.row.record_keys === '');
+	assert.ok(s.ok && s.target === "rows" && s.row.step_uuid === STEP && s.row.record_keys === '');
 	const r = checkWrite({ fact: 'x', scope: 'records' }, { bundle: bundle(), step, recordKeys: '12, 7', now: NOW });
-	assert.ok(r.ok && r.row.record_keys === '12,7');
+	assert.ok(r.ok && r.target === "rows" && r.row.record_keys === '12,7');
 	assert.ok(!checkWrite({ fact: 'x', scope: 'step' }, { bundle: bundle(), now: NOW }).ok);
 	assert.ok(!checkWrite({ fact: 'x', scope: 'records' }, { bundle: bundle(), step, now: NOW }).ok);
 	assert.ok(!checkWrite({ fact: 'x', scope: 'everything' }, { bundle: bundle(), now: NOW }).ok);
@@ -174,7 +174,7 @@ test('memory: the prompt gets at most maxFacts and maxChars', () => {
 
 test('memory: forgetting writes an empty fact that hides the topic', () => {
 	const forget = checkWrite({ forget: true, topic: 'Rounding' }, { bundle: bundle(), now: NOW });
-	assert.ok(forget.ok && forget.row.fact === '' && forget.row.topic === 'rounding');
+	assert.ok(forget.ok && forget.target === "rows" && forget.row.fact === '' && forget.row.topic === 'rounding');
 	const res = selectMemory([row({ topic: 'rounding', fact: 'Rounds to cents.' }), { ...forget.row, id: 99 }], { bundle: bundle(), now: NOW });
 	assert.deepEqual(res.memory, []);
 	assert.ok(!checkWrite({ forget: true }, { bundle: bundle(), now: NOW }).ok, 'forgetting needs a topic');
