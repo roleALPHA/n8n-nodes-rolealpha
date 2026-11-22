@@ -16,6 +16,8 @@ export interface BundleItem {
 	name: string;
 	version?: string;
 	body?: Record<string, unknown> | null;
+	/** How the item was reached: the link type and its attributes (e.g. a focus or a competence level). */
+	provenance?: { relType?: string; attributes?: Record<string, unknown> | null } | null;
 }
 
 export interface ContextBundle {
@@ -124,6 +126,45 @@ function roleBlock(item: BundleItem): string[] {
 	return lines;
 }
 
+/** Body fields that say nothing to the agent, or are already in the heading. */
+const CONTEXT_SKIP = new Set(['subtype', 'scope']);
+/** The text that describes an item comes first, the other fields after it. */
+const CONTEXT_FIRST = ['description', 'purpose', 'summary', 'text'];
+/** One value of a context item is cut to this size, so one long item cannot crowd out the rest. */
+export const CONTEXT_VALUE_MAX = 1500;
+
+function cut(value: string): string {
+	return value.length > CONTEXT_VALUE_MAX ? `${value.slice(0, CONTEXT_VALUE_MAX)} …` : value;
+}
+
+/** Any context item that is not a role: OKR, project, process, competence, risk, IT system, … */
+export function contextItemBlock(item: BundleItem): string[] {
+	const body = item.body ?? {};
+	const meta = [item.kind, text(body.subtype), item.version ? `v${item.version}` : ''].filter(Boolean).join(', ');
+	const lines = [`- ${item.name}${meta ? ` (${meta})` : ''}`];
+	const attributes = Object.entries(item.provenance?.attributes ?? {})
+		.map(([k, v]) => [k, text(v)])
+		.filter(([, v]) => v);
+	if (attributes.length) lines.push(`  Link: ${attributes.map(([k, v]) => `${k}: ${cut(v)}`).join('; ')}`);
+	const keys = Object.keys(body).filter((k) => !CONTEXT_SKIP.has(k));
+	keys.sort((a, b) => {
+		const ia = CONTEXT_FIRST.indexOf(a);
+		const ib = CONTEXT_FIRST.indexOf(b);
+		return (ia < 0 ? CONTEXT_FIRST.length : ia) - (ib < 0 ? CONTEXT_FIRST.length : ib);
+	});
+	for (const key of keys) {
+		const value = body[key];
+		if (Array.isArray(value)) {
+			const items = value.map(text).filter(Boolean);
+			if (items.length) lines.push(`  ${key}:`, ...items.map((v) => `    - ${cut(v)}`));
+		} else {
+			const single = text(value);
+			if (single) lines.push(`  ${key}: ${cut(single)}`);
+		}
+	}
+	return lines;
+}
+
 function holderNames(step: Step, which: 'decidingRoles' | 'accountableRoles' | 'responsibleRoles'): string {
 	return step[which]
 		.map((role) => {
@@ -160,6 +201,14 @@ export function buildSystemPrompt(input: PromptInput): string {
 	out.push('', '# Your roles');
 	if (roles.length === 0) out.push('- none');
 	for (const role of roles) out.push(...roleBlock(role));
+
+	// Everything else roleALPHA puts into the agent's context (OKRs, projects, processes, …).
+	// The current step is listed in full below, so it is left out here.
+	const further = bundle.context.filter((c) => c.kind !== 'role' && !(step && c.uuid === step.uuid));
+	if (further.length) {
+		out.push('', '# Further context (from roleALPHA, informational; guardrails and policies win)');
+		for (const item of further) out.push(...contextItemBlock(item));
+	}
 
 	if (duties.length) {
 		out.push('', '# Steps your roles are responsible for');

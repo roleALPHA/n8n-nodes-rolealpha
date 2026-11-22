@@ -6,7 +6,7 @@ import { canonicalJson, legacySeal, signSeal, verifySeal } from '../lib/seal';
 import { parseEvent, parseSecrets, signBody, verifySignature } from '../lib/webhook';
 import { keyFor, parseKeyring } from '../lib/keys';
 import { isDue, isoWeek } from '../lib/schedule';
-import { buildSystemPrompt } from '../lib/prompt';
+import { buildSystemPrompt, CONTEXT_VALUE_MAX } from '../lib/prompt';
 import { getStep } from '../lib/graph';
 import { STEP_GATE, sampleGraph } from './fixtures';
 
@@ -215,6 +215,42 @@ test('buildSystemPrompt is built only from roleALPHA data', async () => {
 		assert.ok(prompt.includes(part), `missing: ${part}`);
 	}
 	assert.ok(!prompt.includes('Instructions:'), 'empty instructions are left out');
+});
+
+test('buildSystemPrompt passes on context that is not a role, except the current step', async () => {
+	const step = await getStep(sampleGraph(), STEP_GATE, { resolveHolders: true });
+	const long = 'x'.repeat(CONTEXT_VALUE_MAX + 50);
+	const prompt = buildSystemPrompt({
+		bundle: {
+			agent: { uuid: AGENT_UUID, name: 'Assistant' },
+			guardrails: [],
+			context: [
+				{ kind: 'role', uuid: 'r', name: 'Assistant', body: { purpose: 'Collect decisions' } },
+				{
+					kind: 'okr',
+					binding: 'informational',
+					uuid: 'o',
+					name: 'Decisions within a week',
+					provenance: { relType: 'CONTRIBUTES_TO', attributes: { focus: 'Q4' } },
+					body: { scope: 'team', status: 'on_track', keyResults: ['90 % decided within 7 days', ''], description: 'Faster decisions', notes: long },
+				},
+				{ kind: 'process', uuid: step!.uuid, name: 'Approval', body: { description: 'listed as current step' } },
+			],
+		},
+		step,
+	});
+	const further = prompt.slice(prompt.indexOf('# Further context'));
+	for (const part of ['- Decisions within a week (okr)', 'Link: focus: Q4', 'description: Faster decisions', 'status: on_track', 'keyResults:', '    - 90 % decided within 7 days']) {
+		assert.ok(further.includes(part), `missing: ${part}`);
+	}
+	assert.ok(further.indexOf('description:') < further.indexOf('status:'), 'the description comes first');
+	assert.ok(!further.includes('scope:'), 'scope is left out');
+	assert.ok(!further.includes('listed as current step'), 'the current step is not listed twice');
+	assert.ok(further.includes(`${'x'.repeat(CONTEXT_VALUE_MAX)} …`) && !further.includes('x'.repeat(CONTEXT_VALUE_MAX + 1)), 'long values are cut');
+	assert.ok(prompt.indexOf('# Your roles') < prompt.indexOf('# Further context'));
+
+	const onlyRoles = buildSystemPrompt({ bundle: { agent: { uuid: AGENT_UUID, name: 'A' }, guardrails: [], context: [{ kind: 'role', uuid: 'r', name: 'R' }] } });
+	assert.ok(!onlyRoles.includes('# Further context'), 'no section without further context');
 });
 
 test('agentStatus reads status or the last part of the summary', () => {
