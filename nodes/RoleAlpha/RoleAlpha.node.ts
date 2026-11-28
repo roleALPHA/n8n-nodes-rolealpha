@@ -8,6 +8,7 @@ import type {
 } from 'n8n-workflow';
 import { NodeConnectionTypes, NodeOperationError } from 'n8n-workflow';
 import { McpClient, type HttpReply } from '../../lib/mcp';
+import { sharedPacer } from '../../lib/pacer';
 import {
 	checkApprover,
 	findStepByCustomId,
@@ -1065,7 +1066,11 @@ function agentTransport(ctx: IExecuteFunctions, endpointUrl: string, auth: RunAu
 
 function mcpClientFor(ctx: IExecuteFunctions, endpointUrl: string, auth?: RunAuth): McpClient {
 	if (auth) return new McpClient(agentTransport(ctx, endpointUrl, auth));
+	// All workflows with this credential share one roleALPHA budget: wait for a slot instead of meeting 429.
+	const credentialId = (ctx.getNode().credentials?.mcpOAuth2Api as { id?: string } | undefined)?.id ?? '';
+	const pacer = sharedPacer(`${endpointUrl}|${credentialId}`);
 	const transport = async (body: unknown, headers: Record<string, string>): Promise<HttpReply> => {
+		if (pacer) await pacer.acquire();
 		try {
 			const res = (await ctx.helpers.httpRequestWithAuthentication.call(ctx, 'mcpOAuth2Api', {
 				method: 'POST',
